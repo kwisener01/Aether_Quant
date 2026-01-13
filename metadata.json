@@ -1,0 +1,7 @@
+{
+  "name": "Aether Quant: Semantic Liquidity Oracle",
+  "description": "A high-end quantitative trading dashboard that uses Gemini's reasoning capabilities to identify 'Blue Ocean' liquidity patterns and provide risk-mitigated trade setups for SPY and QQQ prop firm challenges.",
+  "requestFramePermissions": [
+    "geolocation"
+  ]
+}
