@@ -25,13 +25,8 @@ PROP FIRM PROTECTION:
 Respond ONLY with valid JSON. Do not include any text outside the JSON block.
 `;
 
-/**
- * Robust JSON extraction helper to handle cases where the model might wrap response in markdown blocks
- * or include stray characters.
- */
 const sanitizeJsonResponse = (text: string): string => {
   let cleaned = text.trim();
-  // Remove markdown code blocks if present
   if (cleaned.startsWith('```')) {
     cleaned = cleaned.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
   }
@@ -39,15 +34,14 @@ const sanitizeJsonResponse = (text: string): string => {
 };
 
 export const fetchMarketDataViaSearch = async (symbol: string): Promise<Partial<MarketData> & { sources: any[] }> => {
-  // We limit the history to a specific count to prevent the JSON payload from becoming too large and truncating.
   const prompt = `Find current price, 24h change, and VIX for ${symbol}. 
   CRITICAL: Also find the current estimated Total Gamma Exposure (GEX) in billions and the Vanna exposure level for ${symbol}. 
   Provide these as numeric values. 
-  In the history array, provide exactly 15 key historical intervals (major pivots or high volume areas) with their estimated GEX and Vanna metrics.`;
+  In the history array, provide exactly 15 key historical intervals with their estimated GEX and Vanna metrics.`;
   
   try {
     const response = await ai.models.generateContent({
-      model: "gemini-3-pro-preview",
+      model: "gemini-3-flash-preview", // Switched to Flash for faster search extraction
       contents: prompt,
       config: {
         tools: [{ googleSearch: {} }],
@@ -58,8 +52,8 @@ export const fetchMarketDataViaSearch = async (symbol: string): Promise<Partial<
             currentPrice: { type: Type.NUMBER },
             change24h: { type: Type.NUMBER },
             vix: { type: Type.NUMBER },
-            gamma: { type: Type.NUMBER, description: "Estimated GEX in billions (e.g. 2.5)" },
-            vanna: { type: Type.NUMBER, description: "Estimated Vanna exposure level" },
+            gamma: { type: Type.NUMBER },
+            vanna: { type: Type.NUMBER },
             history: {
               type: Type.ARRAY,
               items: {
@@ -68,8 +62,8 @@ export const fetchMarketDataViaSearch = async (symbol: string): Promise<Partial<
                   time: { type: Type.STRING },
                   price: { type: Type.NUMBER },
                   volume: { type: Type.NUMBER },
-                  gamma: { type: Type.NUMBER, description: "Historical GEX at this point" },
-                  vanna: { type: Type.NUMBER, description: "Historical Vanna at this point" }
+                  gamma: { type: Type.NUMBER },
+                  vanna: { type: Type.NUMBER }
                 }
               }
             }
@@ -92,7 +86,6 @@ export const fetchMarketDataViaSearch = async (symbol: string): Promise<Partial<
 };
 
 export const analyzeMarket = async (data: MarketData): Promise<AnalysisResponse> => {
-  // Prune history to essential points for the analysis prompt to stay within token limits and ensure parsing reliability
   const prunedHistory = data.history.slice(-30).map(h => ({ 
     p: h.price, 
     t: h.time, 
@@ -109,17 +102,19 @@ export const analyzeMarket = async (data: MarketData): Promise<AnalysisResponse>
     ${JSON.stringify(prunedHistory)}
     
     TASKS:
-    1. Assess Dealer Hedging positioning using the provided Gamma/Vanna metrics.
-    2. Identify the "Path of Least Resistance" considering liquidity voids.
+    1. Assess Dealer Hedging positioning.
+    2. Identify the "Path of Least Resistance."
     3. Output a high-conviction trade setup with 3:1 RR.
   `;
 
   try {
     const response = await ai.models.generateContent({
-      model: "gemini-3-pro-preview",
+      model: "gemini-3-pro-preview", // Use Pro for the actual "Oracle" logic
       contents: prompt,
       config: {
         systemInstruction: SYSTEM_INSTRUCTION,
+        // Added thinkingBudget to allow the model to reason deeply before outputting JSON
+        thinkingConfig: { thinkingBudget: 16384 },
         responseMimeType: "application/json",
         responseSchema: {
           type: Type.OBJECT,

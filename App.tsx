@@ -35,7 +35,6 @@ const App: React.FC = () => {
   
   const tradierRef = useRef<TradierService | null>(null);
 
-  // Auto-clear notification after delay
   useEffect(() => {
     if (errorNotification) {
       const timer = setTimeout(() => setErrorNotification(null), 5000);
@@ -43,7 +42,6 @@ const App: React.FC = () => {
     }
   }, [errorNotification]);
 
-  // Persistence logic
   useEffect(() => {
     const savedHistory = localStorage.getItem('SIGNAL_HISTORY');
     if (savedHistory) {
@@ -224,11 +222,9 @@ const App: React.FC = () => {
 
   return (
     <div className="min-h-screen p-4 md:p-8 max-w-7xl mx-auto space-y-6 relative overflow-hidden">
-      {/* Background Decor */}
       <div className="fixed top-[-10%] right-[-10%] w-[500px] h-[500px] bg-sky-500/5 rounded-full blur-[120px] pointer-events-none" />
       <div className="fixed bottom-[-10%] left-[-10%] w-[500px] h-[500px] bg-emerald-500/5 rounded-full blur-[120px] pointer-events-none" />
 
-      {/* Global Error Notification */}
       {errorNotification && (
         <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-[150] flex items-center gap-3 px-6 py-4 bg-slate-900 border border-rose-500/50 rounded-2xl shadow-[0_10px_40px_rgba(0,0,0,0.5)] animate-in slide-in-from-bottom duration-300">
            <div className={`w-2 h-2 rounded-full animate-pulse ${errorNotification.type === 'ERROR' ? 'bg-rose-500' : 'bg-amber-500'}`} />
@@ -481,6 +477,7 @@ const App: React.FC = () => {
                 <h2 className="text-2xl font-black text-white tracking-tighter uppercase">Oracle Output</h2>
                 <div className="flex items-center gap-2">
                   <span className="text-[8px] bg-sky-500/20 text-sky-400 px-2 py-0.5 rounded font-black tracking-widest uppercase">Gamma_Vanna_Aware</span>
+                  <span className="text-[8px] bg-emerald-500/20 text-emerald-400 px-2 py-0.5 rounded font-black tracking-widest uppercase">Deep_Reasoning_Active</span>
                 </div>
               </div>
               <button 
@@ -499,9 +496,9 @@ const App: React.FC = () => {
                   <div className="absolute inset-0 border-4 border-sky-500 border-t-transparent rounded-full animate-spin"></div>
                 </div>
                 <div className="space-y-3">
-                  <p className="text-white text-xs font-black uppercase tracking-[0.5em]">Deconstructing Flows</p>
+                  <p className="text-white text-xs font-black uppercase tracking-[0.5em]">Deep Thinking Mode</p>
                   <p className="text-slate-600 text-[10px] font-mono animate-pulse uppercase tracking-widest">
-                    Synthesizing Dealer Positioning...
+                    Synthesizing Dealer Positioning & Reasoning...
                   </p>
                 </div>
               </div>
@@ -555,7 +552,7 @@ const App: React.FC = () => {
                 </div>
 
                 <div className="mt-auto pt-8 text-[9px] text-slate-700 flex justify-between font-mono uppercase tracking-[0.4em] font-bold">
-                  <span>Logic_v6.0.FLOW</span>
+                  <span>Logic_v6.5.DEEP</span>
                   <span>{lastUpdate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
                 </div>
               </div>
@@ -659,7 +656,7 @@ const App: React.FC = () => {
         </div>
         <div className="space-y-4">
           <p className="text-slate-800 text-[10px] max-w-2xl mx-auto leading-relaxed uppercase tracking-[0.6em] font-black opacity-40 font-mono">
-            Aether Quant | High-Frequency Liquidity Protocol v1.6.0
+            Aether Quant | High-Frequency Liquidity Protocol v1.6.5
           </p>
           <div className="flex justify-center gap-6">
             <button 
