@@ -1,6 +1,6 @@
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { MarketData, AnalysisResponse, HistoricalSignal, PricePoint } from './types';
+import { MarketData, AnalysisResponse, HistoricalSignal, PricePoint, Tick, TickWindow, TickLabel } from './types';
 import { SYMBOLS, ICONS } from './constants';
 import { analyzeMarket, fetchMarketDataViaSearch } from './services/geminiService';
 import { TradierService } from './services/tradierService';
@@ -9,13 +9,12 @@ import MarketChart from './components/MarketChart';
 const formatToEST = (date: Date) => {
   return date.toLocaleString('en-US', {
     timeZone: 'America/New_York',
-    month: 'short',
-    day: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false
+    month: 'short', day: 'numeric',
+    hour: '2-digit', minute: '2-digit', hour12: false
   });
 };
+
+type StreamingStatus = 'IDLE' | 'AUTH_REQUIRED' | 'MARKET_CLOSED' | 'CONNECTING' | 'LIVE' | 'SIMULATING' | 'ERROR';
 
 const App: React.FC = () => {
   const [selectedSymbol, setSelectedSymbol] = useState(SYMBOLS[0]);
@@ -24,650 +23,542 @@ const App: React.FC = () => {
   const [analysis, setAnalysis] = useState<AnalysisResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [fetchingData, setFetchingData] = useState(false);
+  const [apiError, setApiError] = useState<string | null>(null);
   const [lastUpdate, setLastUpdate] = useState<Date>(new Date());
-  const [dataSources, setDataSources] = useState<any[]>([]);
-  const [dataSourceType, setDataSourceType] = useState<'TRADIER' | 'GEMINI_SEARCH' | 'NONE'>('NONE');
   const [showVault, setShowVault] = useState(false);
   const [inputToken, setInputToken] = useState('');
   const [isSandbox, setIsSandbox] = useState(false);
   const [signalHistory, setSignalHistory] = useState<HistoricalSignal[]>([]);
-  const [errorNotification, setErrorNotification] = useState<{ message: string; type: 'ERROR' | 'WARN' } | null>(null);
+  const [isSimulating, setIsSimulating] = useState(false);
+  const [searchCitations, setSearchCitations] = useState<{title: string, uri: string}[]>([]);
+
+  const [streamingStatus, setStreamingStatus] = useState<StreamingStatus>('IDLE');
+  const [tickBuffer, setTickBuffer] = useState<Tick[]>([]);
+  const [windowHistory, setWindowHistory] = useState<TickWindow[]>([]);
+  const [lastProcessedMid, setLastProcessedMid] = useState<number>(0);
+  const [tickHeartbeat, setTickHeartbeat] = useState(0);
+  
+  const [windowsSinceRetrain, setWindowsSinceRetrain] = useState(0);
   
   const tradierRef = useRef<TradierService | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+  const simIntervalRef = useRef<number | null>(null);
+  const fetchAbortController = useRef<AbortController | null>(null);
 
-  useEffect(() => {
-    if (errorNotification) {
-      const timer = setTimeout(() => setErrorNotification(null), 5000);
-      return () => clearTimeout(timer);
-    }
-  }, [errorNotification]);
+  const handleNewTickRef = useRef<(tick: Tick) => void>(() => {});
 
-  useEffect(() => {
-    const savedHistory = localStorage.getItem('SIGNAL_HISTORY');
-    if (savedHistory) {
-      try {
-        setSignalHistory(JSON.parse(savedHistory));
-      } catch (e) {
-        console.error("Failed to parse history", e);
+  const handleNewTick = useCallback((tick: Tick) => {
+    setTickBuffer(prev => {
+      const newBuffer = [...prev, tick];
+      if (newBuffer.length >= 5) {
+        if (!tradierRef.current) return [];
+        const window = tradierRef.current.calculateWindowLabel(newBuffer, lastProcessedMid || tick.mid);
+        setLastProcessedMid(window.meanMid);
+        setWindowHistory(wh => [window, ...wh].slice(0, 20));
+        setWindowsSinceRetrain(ws => ws + 1);
+        return [];
       }
-    }
-  }, []);
+      return newBuffer;
+    });
+  }, [lastProcessedMid]);
 
   useEffect(() => {
-    localStorage.setItem('SIGNAL_HISTORY', JSON.stringify(signalHistory));
-  }, [signalHistory]);
+    handleNewTickRef.current = handleNewTick;
+  }, [handleNewTick]);
+
+  const fetchData = useCallback(async () => {
+    if (fetchAbortController.current) fetchAbortController.current.abort();
+    fetchAbortController.current = new AbortController();
+
+    setFetchingData(true);
+    setApiError(null);
+    setMarketData(null); 
+    
+    try {
+      const searchMeta = await fetchMarketDataViaSearch(selectedSymbol);
+      const hp = searchMeta.hp || 0;
+      const mhp = searchMeta.mhp || 0;
+      const hg = (searchMeta.yesterdayClose && searchMeta.todayOpen) ? (searchMeta.yesterdayClose + searchMeta.todayOpen) / 2 : 0;
+      
+      let bias: any = 'NEUTRAL';
+      if (hp === mhp && hp !== 0) bias = 'SQUEEZE';
+      else if (hp > mhp) bias = 'BULLISH';
+      else if (mhp > hp) bias = 'BEARISH';
+
+      setSearchCitations(searchMeta.citations || []);
+
+      let history: PricePoint[] = [];
+      if (isTradierConnected && tradierRef.current) {
+        try {
+          const h = await tradierRef.current.getIntradayHistory(selectedSymbol);
+          history = h.map((bar: any) => ({ 
+            time: formatToEST(new Date(bar.time || bar.date)), 
+            price: bar.close || bar.price, 
+            volume: bar.volume 
+          }));
+        } catch (e) {
+          history = searchMeta.history.map((h: any) => ({ time: h.time, price: h.price, volume: 0 }));
+        }
+      } else {
+        history = searchMeta.history.map((h: any) => ({ time: h.time, price: h.price, volume: 0 }));
+      }
+
+      setMarketData({
+        symbol: selectedSymbol,
+        currentPrice: searchMeta.currentPrice || 0,
+        change24h: searchMeta.change24h || 0,
+        volume24h: 0, 
+        vix: searchMeta.vix || 15,
+        history, 
+        levels: { hp, mhp, hg, bias }
+      });
+    } catch (e: any) { 
+      if (e.name === 'AbortError') return;
+      console.error("Data Fetch Failed:", e); 
+      if (e.message?.includes('429') || e.status === 'RESOURCE_EXHAUSTED' || e.message?.includes('RESOURCE_EXHAUSTED')) {
+        setApiError('QUOTA_EXCEEDED');
+      } else {
+        setApiError('FETCH_FAILED');
+      }
+    } finally { 
+      setFetchingData(false); 
+    }
+  }, [selectedSymbol, isTradierConnected]);
+
+  // RESET LOGIC
+  useEffect(() => {
+    setWindowHistory([]);
+    setTickBuffer([]);
+    setAnalysis(null);
+    setLastProcessedMid(0);
+    setTickHeartbeat(0);
+    setSearchCitations([]);
+    
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+
+    fetchData(); 
+  }, [selectedSymbol, fetchData]);
 
   const initConnection = useCallback(() => {
     const savedToken = localStorage.getItem('TRADIER_TOKEN');
     const savedSandbox = localStorage.getItem('TRADIER_SANDBOX') === 'true';
     const token = savedToken || (process.env as any).TRADIER_TOKEN;
-    const sandbox = savedToken ? savedSandbox : false;
-
-    if (token && token !== '') {
-      tradierRef.current = new TradierService(token, sandbox);
+    
+    if (token) {
+      tradierRef.current = new TradierService(token, savedToken ? savedSandbox : false);
       setIsTradierConnected(true);
-      setDataSourceType('TRADIER');
-      setIsSandbox(sandbox);
+      setIsSandbox(savedSandbox);
       if (!inputToken) setInputToken(token);
     } else {
-      setIsTradierConnected(false);
-      setDataSourceType('GEMINI_SEARCH');
+      setStreamingStatus('AUTH_REQUIRED');
     }
   }, [inputToken]);
 
+  useEffect(() => { initConnection(); }, [initConnection]);
+
+  // Simulation Logic
   useEffect(() => {
-    initConnection();
-  }, [initConnection]);
-
-  const fetchData = useCallback(async () => {
-    setFetchingData(true);
-    try {
-      if (isTradierConnected && tradierRef.current) {
-        const quotes = await tradierRef.current.getQuotes(SYMBOLS.concat(['VIX']));
-        const history = await tradierRef.current.getIntradayHistory(selectedSymbol);
-        
-        const currentQuote = quotes.find(q => q.symbol === selectedSymbol);
-        const vixQuote = quotes.find(q => q.symbol === 'VIX');
-        
-        if (currentQuote) {
-          const searchMeta = await fetchMarketDataViaSearch(selectedSymbol);
-
-          const processedHistory: PricePoint[] = history.map((h, idx) => {
-            const timeStr = formatToEST(new Date(h.date));
-            const flowMatch = searchMeta.history?.find(sh => sh.time.split(',')[1] === timeStr.split(',')[1]);
-            
-            return {
-              time: timeStr,
-              price: h.close,
-              volume: h.volume,
-              gamma: flowMatch?.gamma,
-              vanna: flowMatch?.vanna
-            };
-          });
-
-          if (processedHistory.length > 0 && !processedHistory.some(p => p.gamma !== undefined)) {
-            const lastIdx = processedHistory.length - 1;
-            processedHistory[lastIdx].gamma = searchMeta.gamma;
-            processedHistory[lastIdx].vanna = searchMeta.vanna;
-          }
-
-          setMarketData({
-            symbol: selectedSymbol,
-            currentPrice: currentQuote.last,
-            change24h: currentQuote.change_percentage,
-            volume24h: currentQuote.volume,
-            vix: vixQuote?.last || 15.0,
-            gamma: searchMeta.gamma,
-            vanna: searchMeta.vanna,
-            history: processedHistory
-          });
-        }
-      } else {
-        const data = await fetchMarketDataViaSearch(selectedSymbol);
-        setMarketData({
-          symbol: selectedSymbol,
-          currentPrice: data.currentPrice || 0,
-          change24h: data.change24h || 0,
-          volume24h: 0,
-          vix: data.vix || 15,
-          gamma: data.gamma,
-          vanna: data.vanna,
-          history: (data.history || []).map(h => ({
-            ...h,
-            time: h.time.includes(',') ? h.time : formatToEST(new Date()) 
-          }))
-        });
-        setDataSources(data.sources || []);
+    if (isSimulating) {
+      setStreamingStatus('SIMULATING');
+      simIntervalRef.current = window.setInterval(() => {
+        const currentRefPrice = marketData?.currentPrice || (selectedSymbol === 'SPY' ? 590 : 505);
+        const drift = (Math.random() - 0.49) * 0.15; 
+        const mockTick: Tick = {
+          time: Date.now(),
+          bid: currentRefPrice + drift - 0.04,
+          ask: currentRefPrice + drift + 0.04,
+          last: currentRefPrice + drift,
+          mid: currentRefPrice + drift,
+          spread: 0.08,
+          volume: Math.floor(Math.random() * 15000) + 1000,
+          bidVolume: Math.floor(Math.random() * 7500),
+          askVolume: Math.floor(Math.random() * 7500)
+        };
+        handleNewTickRef.current(mockTick);
+        setTickHeartbeat(h => h + 1);
+      }, 1000);
+    } else {
+      if (simIntervalRef.current) {
+        clearInterval(simIntervalRef.current);
+        simIntervalRef.current = null;
       }
-    } catch (err: any) {
-      console.error("Data Feed Error:", err);
-      const msg = err.message || 'Unknown protocol error';
-      setErrorNotification({ message: `Feed Interrupted: ${msg}`, type: 'ERROR' });
-
-      if (msg.toLowerCase().includes('auth') || msg.toLowerCase().includes('401') || msg.toLowerCase().includes('forbidden')) {
-        setIsTradierConnected(false);
-        setDataSourceType('GEMINI_SEARCH');
-      }
-    } finally {
-      setFetchingData(false);
+      if (isTradierConnected) startStream();
     }
-  }, [selectedSymbol, isTradierConnected]);
+    return () => { if (simIntervalRef.current) clearInterval(simIntervalRef.current); };
+  }, [isSimulating, isTradierConnected, marketData?.currentPrice, selectedSymbol]);
 
-  useEffect(() => {
-    fetchData();
-    const interval = setInterval(fetchData, 60000);
-    return () => clearInterval(interval);
+  const startStream = async () => {
+    if (!tradierRef.current || isSimulating || wsRef.current) return;
+    setStreamingStatus('CONNECTING');
+    try {
+      const sessionId = await tradierRef.current.createStreamSession();
+      const ws = new WebSocket(`wss://ws.tradier.com/v1/markets/events`);
+      ws.onopen = () => {
+        setStreamingStatus('LIVE');
+        ws.send(JSON.stringify({ symbols: [selectedSymbol], sessionid: sessionId, filter: ["quote"], linebreak: true }));
+      };
+      ws.onmessage = (e) => {
+        const raw = JSON.parse(e.data);
+        if (raw.type === 'quote' && raw.symbol === selectedSymbol) {
+          const tick = tradierRef.current?.cleanAndProcessTick(raw);
+          if (tick) {
+            handleNewTickRef.current(tick);
+            setTickHeartbeat(h => h + 1);
+          }
+        }
+      };
+      ws.onclose = () => {
+        if (!isSimulating) setStreamingStatus('IDLE');
+        wsRef.current = null;
+      };
+      wsRef.current = ws;
+    } catch (e) { 
+      setStreamingStatus('ERROR'); 
+    }
+  };
+
+  useEffect(() => { 
+    const interval = setInterval(fetchData, 180000); // 3 minutes for search to avoid limits
+    return () => clearInterval(interval); 
   }, [fetchData]);
 
   const runAnalysis = useCallback(async () => {
-    if (!marketData || marketData.history.length === 0) return;
+    if (!marketData || windowHistory.length === 0 || loading) return;
     setLoading(true);
+    setApiError(null);
     try {
-      const result = await analyzeMarket(marketData);
+      const isRetrainEvent = windowsSinceRetrain >= 100;
+      const result = await analyzeMarket(marketData, windowHistory, isRetrainEvent);
+      if (isRetrainEvent) setWindowsSinceRetrain(0);
+      
       setAnalysis(result);
       setLastUpdate(new Date());
-
-      const lastBar = marketData.history[marketData.history.length - 1];
-
-      const newEntry: HistoricalSignal = {
-        ...result.signal,
-        id: crypto.randomUUID(),
-        symbol: marketData.symbol,
-        timestamp: new Date().toISOString(),
-        chartTime: lastBar.time,
-        priceAtSignal: marketData.currentPrice
-      };
-      setSignalHistory(prev => [newEntry, ...prev].slice(0, 50));
-    } catch (err: any) {
-      console.error("Oracle Failed:", err);
-      setErrorNotification({ message: `Oracle Logical Error: ${err.message || 'Failed to parse market state'}`, type: 'ERROR' });
-    } finally {
-      setLoading(false);
+      setSignalHistory(prev => [{
+        ...result.signal, id: crypto.randomUUID(), symbol: marketData.symbol, timestamp: new Date().toISOString(),
+        chartTime: marketData.history[marketData.history.length-1]?.time || '',
+        priceAtSignal: marketData.currentPrice,
+        liquidityZone: result.signal.isGoldenSetup ? 'GOLDEN SETUP' : result.signal.liquidityZone || 'NEUTRAL ZONE'
+      }, ...prev].slice(0, 50));
+    } catch (e: any) { 
+      console.error("Analysis Failed:", e); 
+      if (e.message?.includes('429') || e.status === 'RESOURCE_EXHAUSTED' || e.message?.includes('RESOURCE_EXHAUSTED')) {
+        setApiError('QUOTA_EXCEEDED');
+      } else {
+        setApiError('ANALYSIS_FAILED');
+      }
+    } finally { 
+      setLoading(false); 
     }
-  }, [marketData]);
+  }, [marketData, windowHistory, windowsSinceRetrain, loading]);
 
   const handleSaveToken = () => {
-    if (inputToken.trim()) {
-      localStorage.setItem('TRADIER_TOKEN', inputToken.trim());
-      localStorage.setItem('TRADIER_SANDBOX', isSandbox.toString());
-      initConnection();
-      setShowVault(false);
-    }
-  };
-
-  const handleClearToken = () => {
-    localStorage.removeItem('TRADIER_TOKEN');
-    localStorage.removeItem('TRADIER_SANDBOX');
-    setInputToken('');
-    setIsSandbox(false);
-    tradierRef.current = null;
-    setIsTradierConnected(false);
-    setDataSourceType('GEMINI_SEARCH');
-    setShowVault(false);
-  };
-
-  const clearHistory = () => {
-    if (window.confirm("Purge all historical signal records?")) {
-      setSignalHistory([]);
-    }
-  };
-
-  const getSignalBadge = (type: string) => {
-    switch (type) {
-      case 'BUY': return 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20';
-      case 'SELL': return 'bg-rose-500/10 text-rose-400 border-rose-500/20';
-      default: return 'bg-slate-500/10 text-slate-400 border-slate-500/20';
-    }
+    localStorage.setItem('TRADIER_TOKEN', inputToken);
+    localStorage.setItem('TRADIER_SANDBOX', isSandbox.toString());
+    initConnection(); setShowVault(false);
   };
 
   return (
-    <div className="min-h-screen p-4 md:p-8 max-w-7xl mx-auto space-y-6 relative overflow-hidden">
-      <div className="fixed top-[-10%] right-[-10%] w-[500px] h-[500px] bg-sky-500/5 rounded-full blur-[120px] pointer-events-none" />
-      <div className="fixed bottom-[-10%] left-[-10%] w-[500px] h-[500px] bg-emerald-500/5 rounded-full blur-[120px] pointer-events-none" />
+    <div className="min-h-screen p-4 md:p-8 max-w-7xl mx-auto space-y-6 relative overflow-hidden bg-[#020617] text-[#f8fafc]">
+      <div className="fixed top-[-10%] right-[-10%] w-[500px] h-[500px] bg-sky-500/10 rounded-full blur-[120px] pointer-events-none" />
+      <div className="fixed bottom-[-10%] left-[-10%] w-[500px] h-[500px] bg-emerald-500/10 rounded-full blur-[120px] pointer-events-none" />
 
-      {errorNotification && (
-        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-[150] flex items-center gap-3 px-6 py-4 bg-slate-900 border border-rose-500/50 rounded-2xl shadow-[0_10px_40px_rgba(0,0,0,0.5)] animate-in slide-in-from-bottom duration-300">
-           <div className={`w-2 h-2 rounded-full animate-pulse ${errorNotification.type === 'ERROR' ? 'bg-rose-500' : 'bg-amber-500'}`} />
-           <span className="text-xs font-mono font-bold text-white tracking-tight uppercase">
-             {errorNotification.message}
-           </span>
-           <button onClick={() => setErrorNotification(null)} className="ml-4 text-slate-500 hover:text-white">
-             <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-           </button>
+      {/* Improved Error Notification */}
+      {apiError === 'QUOTA_EXCEEDED' && (
+        <div className="fixed top-6 left-1/2 -translate-x-1/2 z-[200] w-full max-w-md animate-in slide-in-from-top-4 duration-500">
+          <div className="bg-rose-500/10 backdrop-blur-xl border border-rose-500/30 p-4 rounded-2xl flex flex-col gap-3 shadow-2xl">
+            <div className="flex items-center gap-4">
+              <div className="bg-rose-500 p-2 rounded-lg">
+                <ICONS.Shield size={18} className="text-white" />
+              </div>
+              <div>
+                <p className="text-[10px] font-black uppercase tracking-widest text-rose-400 mb-0.5">Heavy API Demand</p>
+                <p className="text-[11px] text-slate-400 font-medium">Switching to 2.5 Flash tier. Re-syncing logic engaged.</p>
+              </div>
+              <button onClick={() => setApiError(null)} className="ml-auto text-slate-500 hover:text-white transition-colors">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+              </button>
+            </div>
+            <div className="flex gap-2">
+               <button onClick={fetchData} className="flex-1 py-2 bg-rose-500/20 hover:bg-rose-500/40 border border-rose-500/30 rounded-xl text-[9px] font-black uppercase tracking-widest transition-all">Force Pivot Re-Sync</button>
+               <button onClick={() => { setIsSimulating(true); setApiError(null); }} className="flex-1 py-2 bg-sky-500/20 hover:bg-sky-500/40 border border-sky-500/30 rounded-xl text-[9px] font-black uppercase tracking-widest transition-all">Enable Sim Engine</button>
+            </div>
+          </div>
         </div>
       )}
+
+      {/* Nav Matrix */}
+      <div className="flex flex-col md:flex-row items-center gap-6 px-8 py-4 bg-slate-900/60 backdrop-blur-xl rounded-3xl border border-slate-800 w-full relative z-[100] shadow-2xl justify-between">
+        <div className="flex items-center gap-6">
+          <div className="flex flex-col">
+             <div className="flex items-center gap-2">
+                <div className={`w-2 h-2 rounded-full ${
+                   streamingStatus === 'LIVE' ? 'bg-emerald-500 animate-pulse' : 
+                   streamingStatus === 'SIMULATING' ? 'bg-sky-500 animate-pulse' :
+                   'bg-rose-500'
+                }`} />
+                <span className="text-[10px] font-black uppercase tracking-widest text-slate-400">Model Series: 2.5 Flash</span>
+             </div>
+          </div>
+          <div className="h-8 w-px bg-slate-800" />
+          <div className="flex flex-col">
+             <span className="text-[8px] font-black uppercase tracking-widest text-slate-500 mb-1">Model Retrain</span>
+             <div className="flex items-center gap-2">
+                <div className="w-24 h-1.5 bg-slate-800 rounded-full overflow-hidden">
+                   <div className="h-full bg-sky-500 transition-all duration-300" style={{ width: `${Math.min(windowsSinceRetrain, 100)}%` }} />
+                </div>
+                <span className="text-[10px] font-mono font-bold text-sky-400">{windowsSinceRetrain}/100</span>
+             </div>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-6">
+           <div className="flex flex-col items-center">
+              <span className="text-[8px] font-black uppercase tracking-widest text-slate-500 mb-1">Simulation</span>
+              <button onClick={() => setIsSimulating(!isSimulating)} className={`w-10 h-5 rounded-full p-1 transition-all ${isSimulating ? 'bg-sky-500' : 'bg-slate-800'}`}>
+                 <div className={`w-3 h-3 bg-white rounded-full transition-all ${isSimulating ? 'translate-x-5' : 'translate-x-0'}`} />
+              </button>
+           </div>
+           <div className={`px-4 py-2 rounded-2xl border text-[10px] font-black uppercase tracking-widest transition-all ${
+              marketData?.levels?.bias === 'SQUEEZE' ? 'bg-purple-500/10 text-purple-400 border-purple-500/30 animate-pulse' :
+              marketData?.levels?.bias === 'BULLISH' ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30' : 
+              marketData?.levels?.bias === 'BEARISH' ? 'bg-rose-500/10 text-rose-400 border-rose-500/30' : 
+              'bg-slate-800/50 text-slate-400 border-slate-800'
+           }`}>
+              {fetchingData ? 'Pivots Syncing...' : `Bias: ${marketData?.levels?.bias || 'Neutral'}`}
+           </div>
+        </div>
+
+        <button onClick={() => setShowVault(true)} className="px-5 py-2 glass-effect hover:bg-slate-800/80 rounded-xl border border-slate-700 transition-all active:scale-95 flex items-center gap-2 text-[10px] font-black uppercase tracking-widest">
+          <ICONS.Shield size={12} className="text-sky-400" />
+          Vault
+        </button>
+      </div>
 
       {showVault && (
         <div className="fixed inset-0 z-[110] flex items-center justify-center bg-slate-950/95 backdrop-blur-2xl p-6">
           <div className="max-w-md w-full glass-effect rounded-3xl p-8 border-sky-500/30 shadow-2xl space-y-8 animate-in zoom-in duration-300">
-            <div className="space-y-2">
-              <h2 className="text-2xl font-black text-white tracking-tighter uppercase flex items-center gap-3">
-                <ICONS.Shield className="text-sky-400" />
-                Auth Protocol
-              </h2>
-              <p className="text-slate-400 text-xs font-mono uppercase tracking-widest">Connect Tradier REST Feed</p>
-            </div>
-
-            <div className="space-y-6">
-              <div className="space-y-2">
-                <label className="text-[10px] text-slate-500 font-black uppercase tracking-widest ml-1">REST API Token</label>
-                <input 
-                  type="password"
-                  value={inputToken}
-                  onChange={(e) => setInputToken(e.target.value)}
-                  placeholder="Paste Token..."
-                  className="w-full bg-slate-900 border border-slate-800 rounded-xl px-4 py-3 text-sky-400 font-mono text-sm focus:outline-none focus:border-sky-500/50 transition-colors"
-                />
-              </div>
-
-              <label className="flex items-center gap-3 cursor-pointer group">
-                <div className="relative">
-                  <input 
-                    type="checkbox" 
-                    checked={isSandbox} 
-                    onChange={(e) => setIsSandbox(e.target.checked)}
-                    className="sr-only"
-                  />
-                  <div className={`w-10 h-5 rounded-full transition-colors ${isSandbox ? 'bg-sky-500' : 'bg-slate-800'}`} />
-                  <div className={`absolute top-1 left-1 w-3 h-3 bg-white rounded-full transition-transform ${isSandbox ? 'translate-x-5' : ''}`} />
-                </div>
-                <span className="text-[10px] text-slate-400 font-bold uppercase tracking-widest group-hover:text-slate-300 transition-colors font-mono">
-                  Sandbox Context
-                </span>
-              </label>
-            </div>
-
-            <div className="flex flex-col gap-3 pt-4">
-              <button 
-                onClick={handleSaveToken}
-                className="w-full py-4 bg-sky-500 text-white font-black uppercase tracking-[0.3em] text-[11px] rounded-2xl shadow-[0_10px_30px_rgba(14,165,233,0.3)] hover:bg-sky-400 transition-colors"
-              >
-                Establish Link
-              </button>
-              <button 
-                onClick={handleClearToken}
-                className="w-full py-3 text-rose-500/70 hover:text-rose-400 text-[9px] font-black uppercase tracking-widest transition-colors mb-2"
-              >
-                Disconnect Link
-              </button>
-              <button 
-                onClick={() => setShowVault(false)}
-                className="w-full py-3 text-slate-500 hover:text-white text-[9px] font-black uppercase tracking-widest transition-colors"
-              >
-                Return to Terminal
-              </button>
+            <h2 className="text-2xl font-black text-white tracking-tighter uppercase flex items-center gap-2">
+               <ICONS.Shield className="text-sky-400" /> Tradier Connect
+            </h2>
+            <input type="password" value={inputToken} onChange={(e) => setInputToken(e.target.value)} placeholder="Tradier API Token..." className="w-full bg-slate-900 border border-slate-800 rounded-xl px-4 py-3 text-sky-400 font-mono text-sm focus:border-sky-500 outline-none" />
+            <div className="flex flex-col gap-3">
+              <button onClick={handleSaveToken} className="w-full py-4 bg-sky-500 text-white font-black uppercase rounded-2xl shadow-lg hover:bg-sky-400 transition-all active:scale-95">Link Market Data</button>
+              <button onClick={() => setShowVault(false)} className="w-full py-3 text-slate-500 text-[9px] font-black uppercase hover:text-white transition-all">Cancel</button>
             </div>
           </div>
         </div>
       )}
 
-      <header className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 border-b border-slate-900 pb-6 relative z-10">
+      <header className="flex justify-between items-center border-b border-slate-900 pb-6 relative z-10">
         <div className="space-y-1">
           <h1 className="text-4xl font-black tracking-tighter neon-text-blue flex items-center gap-3">
             <ICONS.Activity className="text-sky-400 w-8 h-8" />
-            AETHER <span className="font-light text-slate-500">QUANT</span>
+            AETHER <span className="font-light text-slate-500 uppercase">Quant</span>
           </h1>
-          <div className="flex flex-wrap items-center gap-4">
-            <div className="flex items-center gap-2">
-              <span className="text-slate-500 text-[9px] uppercase tracking-[0.3em] font-mono">Feed:</span>
-              <span className={`flex items-center gap-1.5 text-[9px] font-mono font-bold ${dataSourceType === 'TRADIER' ? 'text-emerald-400' : 'text-sky-400'}`}>
-                <div className={`w-1.5 h-1.5 rounded-full ${fetchingData ? 'animate-ping' : ''} ${dataSourceType === 'TRADIER' ? 'bg-emerald-500' : 'bg-sky-500'}`} />
-                {dataSourceType === 'TRADIER' ? `TRADIER_SEARCH_HYBRID` : 'GEMINI_FALLBACK'}
-              </span>
-            </div>
-            <button 
-              onClick={() => setShowVault(true)}
-              className="group flex items-center gap-2 text-[9px] text-slate-500 hover:text-sky-400 transition-colors uppercase tracking-[0.2em] font-black border-b border-slate-800 pb-0.5"
-            >
-              <ICONS.Zap className="w-3 h-3 group-hover:rotate-12 transition-transform" />
-              [VAULT]
-            </button>
-          </div>
+          <p className="text-[9px] font-black uppercase tracking-[0.5em] text-slate-600">Elastic Net Ensemble Execution</p>
         </div>
-        
-        <div className="flex items-center gap-4">
-          <div className="flex bg-slate-950/80 backdrop-blur p-1.5 rounded-xl border border-slate-800 shadow-2xl">
-            {SYMBOLS.map(symbol => (
-              <button
-                key={symbol}
-                onClick={() => setSelectedSymbol(symbol)}
-                className={`px-8 py-2.5 rounded-lg transition-all text-xs font-bold tracking-widest uppercase ${
-                  selectedSymbol === symbol 
-                  ? 'bg-sky-500 text-white shadow-[0_0_20px_rgba(14,165,233,0.3)] scale-105' 
-                  : 'text-slate-500 hover:text-slate-300'
-                }`}
-              >
-                {symbol}
-              </button>
-            ))}
-          </div>
+        <div className="flex bg-slate-950/80 backdrop-blur p-1.5 rounded-xl border border-slate-800 shadow-xl">
+          {SYMBOLS.map(symbol => (
+            <button key={symbol} onClick={() => setSelectedSymbol(symbol)} className={`px-8 py-2.5 rounded-lg transition-all text-xs font-bold tracking-widest uppercase ${selectedSymbol === symbol ? 'bg-sky-500 text-white shadow-2xl scale-105' : 'text-slate-500 hover:text-slate-300'}`}>{symbol}</button>
+          ))}
         </div>
       </header>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-8 relative z-10">
+      <div key={selectedSymbol} className="grid grid-cols-1 lg:grid-cols-4 gap-8 relative z-10">
+        <div className="lg:col-span-1 space-y-6">
+           <div className="glass-effect rounded-3xl p-6 border border-slate-800/50 flex flex-col h-full max-h-[600px] shadow-2xl overflow-hidden relative">
+              <div className="absolute top-6 right-6 flex items-center gap-1.5">
+                 <div key={tickHeartbeat} className="w-1.5 h-1.5 rounded-full bg-sky-500 animate-ping" />
+                 <span className="text-[7px] text-slate-600 font-mono">TICK: {tickBuffer.length}/5</span>
+              </div>
+              <div className="flex justify-between items-center mb-6">
+                <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-[0.3em]">HFT Predictors</h3>
+              </div>
+              <div className="flex-1 overflow-y-auto space-y-4 pr-2 scrollbar-hide">
+                {windowHistory.length === 0 ? (
+                  <div className="h-full flex flex-col items-center justify-center text-center opacity-20 py-20">
+                     <ICONS.Zap size={32} className="mb-4" />
+                     <p className="text-[10px] uppercase font-mono tracking-widest">
+                       {fetchingData ? 'Connecting Symbol...' : 'Awaiting Windows...'}
+                     </p>
+                  </div>
+                ) : windowHistory.map(win => (
+                  <div key={win.id} className="bg-slate-950/50 border border-slate-900 p-4 rounded-xl space-y-3 group hover:border-sky-500/30 transition-all">
+                     <div className="flex justify-between items-center text-[8px] font-mono">
+                        <span className="text-slate-500">{win.timestamp}</span>
+                        <span className={`font-black px-1.5 py-0.5 rounded ${win.label === TickLabel.UPWARDS ? 'text-emerald-400 bg-emerald-500/10' : win.label === TickLabel.DOWNWARDS ? 'text-rose-400 bg-rose-500/10' : 'text-slate-500'}`}>{win.label}</span>
+                     </div>
+                     <div className="grid grid-cols-2 gap-2">
+                        <div className="bg-slate-900/50 p-2 rounded-lg border border-slate-800">
+                           <span className="text-[7px] text-slate-600 block uppercase mb-1">V14 (Ask)</span>
+                           <span className="text-[10px] font-mono font-bold text-sky-400">{win.features.v14_ask_vol.toLocaleString()}</span>
+                        </div>
+                        <div className="bg-slate-900/50 p-2 rounded-lg border border-slate-800">
+                           <span className="text-[7px] text-slate-600 block uppercase mb-1">V15 (Bid)</span>
+                           <span className="text-[10px] font-mono font-bold text-sky-400">{win.features.v15_bid_vol.toLocaleString()}</span>
+                        </div>
+                     </div>
+                  </div>
+                ))}
+              </div>
+           </div>
+           
+           {searchCitations.length > 0 && (
+             <div className="glass-effect p-4 rounded-2xl border border-slate-800/50 text-[8px] font-mono space-y-2 opacity-50 hover:opacity-100 transition-opacity">
+               <span className="uppercase text-slate-500 font-black tracking-widest block mb-2">Institutional Grounding</span>
+               {searchCitations.map((c, i) => (
+                 <a key={i} href={c.uri} target="_blank" rel="noreferrer" className="block text-sky-400 hover:underline truncate">[{i+1}] {c.title}</a>
+               ))}
+             </div>
+           )}
+        </div>
+
         <div className="lg:col-span-2 space-y-8">
-          <div className="glass-effect rounded-3xl p-8 neon-border-blue relative overflow-hidden min-h-[500px] border-t border-sky-500/20">
+          <div className="glass-effect rounded-3xl p-8 border border-sky-500/20 shadow-2xl relative overflow-hidden">
             <div className="flex justify-between items-end mb-10 relative z-10">
               <div className="space-y-1">
-                <div className="text-slate-500 text-[10px] font-mono uppercase tracking-[0.4em]">
-                  Intraday Multi-Day Matrix (3-Day Sequence EST)
+                <span className="text-slate-500 text-[10px] font-mono uppercase tracking-[0.4em]">{selectedSymbol} SPOT PRICE</span>
+                <div className="text-6xl font-black mono text-white tracking-tighter">
+                  {fetchingData ? '$---.--' : `$${marketData?.currentPrice.toFixed(2) || '---.--'}`}
                 </div>
-                <div className="text-6xl font-bold mono tracking-tighter text-white">
-                  {marketData ? `$${marketData.currentPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '---'}
-                </div>
-                <div className={`text-sm font-bold flex items-center gap-1.5 ${marketData && marketData.change24h >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                  {marketData && marketData.change24h >= 0 ? <ICONS.TrendingUp size={18} /> : <ICONS.TrendingDown size={18} />}
-                  {marketData ? `${marketData.change24h.toFixed(2)}%` : '0.00%'}
-                  <span className="text-slate-600 font-normal text-[10px] ml-1 uppercase tracking-widest font-mono">Momentum</span>
-                </div>
+                {marketData && !fetchingData && (
+                  <div className={`text-sm font-bold flex items-center gap-1.5 ${marketData.change24h >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                    {marketData.change24h >= 0 ? <ICONS.TrendingUp size={18} /> : <ICONS.TrendingDown size={18} />}
+                    {marketData.change24h.toFixed(2)}%
+                  </div>
+                )}
               </div>
-              <div className="text-right space-y-1">
-                <div className="text-slate-500 text-[10px] font-mono uppercase tracking-[0.4em]">Fear Gauge (VIX)</div>
-                <div className="text-3xl font-bold mono text-sky-400">
-                  {marketData?.vix.toFixed(2) || '--.--'}
-                </div>
+              <div className="text-right">
+                 <span className="text-slate-500 text-[10px] font-mono uppercase tracking-[0.4em]">VIX</span>
+                 <div className="text-3xl font-bold mono text-sky-400">{fetchingData ? '--.--' : marketData?.vix.toFixed(2)}</div>
               </div>
             </div>
-
-            {marketData && marketData.history.length > 0 ? (
-               <MarketChart 
-                 data={marketData.history} 
-                 symbol={selectedSymbol} 
-                 signals={signalHistory} 
-               />
-            ) : (
-              <div className="h-64 flex flex-col items-center justify-center text-slate-700 italic font-mono space-y-6">
-                <div className="relative">
-                   <div className="w-16 h-16 border-2 border-sky-500/10 border-t-sky-500 rounded-full animate-spin" />
-                   <ICONS.Zap className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-sky-500/40 animate-pulse" size={24} />
-                </div>
-                <div className="text-center space-y-2">
-                  <p className="text-xs uppercase tracking-[0.4em] font-black text-slate-500">Syncing 3-Day Window</p>
-                  <p className="text-[9px] text-slate-600 max-w-[250px] mx-auto leading-relaxed uppercase tracking-widest">
-                    Compiling 1-minute sequences for {selectedSymbol}...
-                  </p>
-                </div>
-              </div>
-            )}
-            
-            <div className="mt-8 flex items-center gap-6 border-t border-slate-900 pt-6">
-               <div className="flex flex-col">
-                  <span className="text-[8px] text-slate-600 font-black uppercase tracking-widest">Timezone</span>
-                  <span className="text-[10px] text-sky-500 font-mono font-bold">EST (New York)</span>
-               </div>
-               <div className="flex flex-col">
-                  <span className="text-[8px] text-slate-600 font-black uppercase tracking-widest">Horizon</span>
-                  <span className="text-[10px] text-emerald-500 font-mono font-bold">3 Trading Days</span>
-               </div>
-            </div>
+            <MarketChart data={marketData?.history || []} symbol={selectedSymbol} signals={signalHistory} levels={marketData?.levels} />
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6 relative z-10">
-             <div className="glass-effect p-6 rounded-2xl border border-slate-800/50 hover:border-sky-500/20 transition-all group">
-                <h3 className="text-slate-400 text-[10px] font-bold uppercase tracking-[0.3em] flex items-center gap-2 mb-6 group-hover:text-sky-400 transition-colors">
-                  <ICONS.Zap size={16} className="text-amber-400" />
-                  Contextual reasoning
-                </h3>
+          <div className="grid grid-cols-2 gap-6">
+             <div className="glass-effect p-6 rounded-2xl border border-slate-800 shadow-xl">
+                <h3 className="text-[9px] text-slate-500 uppercase tracking-widest font-black mb-4">Institutional Pivot Map</h3>
                 <div className="space-y-4">
-                  {analysis?.macroFactors.map((factor, idx) => (
-                    <div key={idx} className="flex items-start gap-3 text-sm text-slate-300 bg-slate-900/40 p-4 rounded-xl border border-slate-800/30">
-                      <div className="mt-1.5 w-1.5 h-1.5 rounded-full bg-sky-500 shadow-[0_0_8px_rgba(14,165,233,0.5)] shrink-0" />
-                      <span className="leading-tight text-xs font-medium">{factor}</span>
-                    </div>
-                  ))}
-                  {!analysis && (
-                    <div className="py-12 text-center border-2 border-dashed border-slate-900/50 rounded-2xl">
-                      <p className="text-[10px] text-slate-700 uppercase tracking-[0.3em] font-black">Scan Inactive</p>
-                    </div>
-                  )}
+                   <div className="flex justify-between items-center border-b border-slate-900 pb-2">
+                      <span className="text-[9px] text-slate-600 uppercase font-bold">HP Weekly</span>
+                      <span className="text-xs font-mono font-bold text-emerald-400">{fetchingData ? '...' : `$${marketData?.levels?.hp.toFixed(2)}`}</span>
+                   </div>
+                   <div className="flex justify-between items-center border-b border-slate-900 pb-2">
+                      <span className="text-[9px] text-slate-600 uppercase font-bold">MHP Monthly</span>
+                      <span className="text-xs font-mono font-bold text-rose-400">{fetchingData ? '...' : `$${marketData?.levels?.mhp.toFixed(2)}`}</span>
+                   </div>
+                   <div className="flex justify-between items-center">
+                      <span className="text-[9px] text-slate-600 uppercase font-bold">HG Half Gap</span>
+                      <span className="text-xs font-mono font-bold text-sky-400">{fetchingData ? '...' : `$${marketData?.levels?.hg.toFixed(2)}`}</span>
+                   </div>
                 </div>
              </div>
-             
-             <div className="glass-effect p-6 rounded-2xl border border-slate-800/50">
-                <h3 className="text-slate-400 text-[10px] font-bold uppercase tracking-[0.3em] flex items-center gap-2 mb-6">
-                  <ICONS.Shield size={16} className="text-emerald-400" />
-                  Risk Protocol
-                </h3>
-                <div className="space-y-6">
-                  <div className="flex justify-between items-center bg-slate-950/50 p-3 rounded-xl border border-slate-900">
-                    <span className="text-[10px] text-slate-500 uppercase tracking-widest font-bold font-mono">Link State</span>
-                    <span className="font-mono font-bold text-[10px] text-emerald-400 uppercase">
-                      FLOW_HYBRID
-                    </span>
-                  </div>
-                  
-                  <div className="grid grid-cols-2 gap-4">
-                    <div className="bg-slate-950/50 p-3 rounded-xl border border-slate-800 space-y-1">
-                      <span className="text-[8px] text-slate-600 font-black uppercase tracking-widest">Gamma (GEX)</span>
-                      <span className="text-xs font-mono font-bold text-sky-400">{marketData?.gamma !== undefined ? `${marketData.gamma}bn` : '--'}</span>
-                    </div>
-                    <div className="bg-slate-950/50 p-3 rounded-xl border border-slate-800 space-y-1">
-                      <span className="text-[8px] text-slate-600 font-black uppercase tracking-widest">Vanna Level</span>
-                      <span className="text-xs font-mono font-bold text-sky-400">{marketData?.vanna !== undefined ? marketData.vanna : '--'}</span>
-                    </div>
-                  </div>
-
-                  <div className="space-y-2">
-                    <div className="flex justify-between items-center text-[10px]">
-                      <span className="text-slate-500 uppercase tracking-widest font-bold">Liquidity Score</span>
-                      <span className="text-sky-400 font-mono font-bold">{analysis?.liquidityScore || 0}%</span>
-                    </div>
-                    <div className="w-full h-1.5 bg-slate-950 rounded-full overflow-hidden border border-slate-900">
-                      <div 
-                        className="h-full bg-gradient-to-r from-sky-600 to-sky-400 transition-all duration-1000" 
-                        style={{ width: `${analysis?.liquidityScore || 0}%` }}
-                      />
-                    </div>
-                  </div>
-                  <div className="bg-slate-950 p-4 rounded-xl border border-slate-800 text-[10px] text-slate-400 leading-relaxed font-mono relative">
-                    <span className="text-emerald-500 text-[9px] font-black uppercase tracking-widest block mb-1">DATA_LOG:</span>
-                    {marketData?.gamma !== undefined 
-                      ? "Structural flow metrics active. Cross-referencing price with GEX magnets."
-                      : "Establishing structural flow sequence. Use search grounding to pull Gamma/Vanna."}
-                  </div>
+             <div className={`glass-effect p-6 rounded-2xl border transition-all duration-700 shadow-xl flex flex-col justify-center text-center space-y-2 relative overflow-hidden ${
+                analysis?.signal.executionStatus === 'RISK ON' ? 'border-emerald-500/50 bg-emerald-500/10' : 
+                analysis?.signal.executionStatus === 'SIT OUT' ? 'border-amber-500/50 bg-amber-500/5' :
+                'border-slate-800'
+             }`}>
+                <h3 className="text-[9px] text-slate-500 uppercase tracking-widest font-black">Execution Status</h3>
+                <div className={`text-2xl font-black italic tracking-tighter ${
+                  analysis?.signal.executionStatus === 'RISK ON' ? 'text-emerald-400 animate-pulse' : 
+                  analysis?.signal.executionStatus === 'SIT OUT' ? 'text-amber-400' :
+                  'text-slate-600'
+                }`}>
+                   {analysis?.signal.executionStatus || (fetchingData ? 'SYNCING...' : 'STANDBY')}
                 </div>
+                {analysis?.signal.isGoldenSetup && (
+                  <div className="px-3 py-1 bg-sky-500/20 text-sky-400 text-[8px] font-black uppercase rounded-full border border-sky-500/20 inline-block mx-auto animate-bounce mt-2 shadow-[0_0_10px_#0ea5e9]">
+                     GOLDEN SETUP
+                  </div>
+                )}
              </div>
           </div>
         </div>
 
-        <div className="space-y-8 relative z-10">
-          <div className="glass-effect rounded-3xl p-8 border-l-[6px] border-l-sky-500 flex flex-col h-full min-h-[500px] shadow-2xl relative overflow-hidden border-t border-sky-500/10">
-            <div className="flex justify-between items-center mb-10">
-              <div className="space-y-1">
-                <h2 className="text-2xl font-black text-white tracking-tighter uppercase">Oracle Output</h2>
-                <div className="flex items-center gap-2">
-                  <span className="text-[8px] bg-sky-500/20 text-sky-400 px-2 py-0.5 rounded font-black tracking-widest uppercase">Gamma_Vanna_Aware</span>
-                  <span className="text-[8px] bg-emerald-500/20 text-emerald-400 px-2 py-0.5 rounded font-black tracking-widest uppercase">Deep_Reasoning_Active</span>
-                </div>
-              </div>
-              <button 
-                onClick={runAnalysis}
-                disabled={loading || !marketData}
-                className="p-3 bg-sky-500/10 hover:bg-sky-500/20 rounded-2xl transition-all disabled:opacity-30 group"
-              >
-                <ICONS.Activity className={`text-sky-400 group-hover:scale-110 transition-transform ${loading ? 'animate-spin' : ''}`} size={24} />
-              </button>
+        <div className="lg:col-span-1">
+          <div className="glass-effect rounded-3xl p-8 border-l-[6px] border-sky-500 h-full flex flex-col shadow-2xl relative overflow-hidden">
+            <div className="flex justify-between items-center mb-8 relative z-10">
+               <h2 className="text-xl font-black text-white tracking-tighter uppercase">ENet Oracle</h2>
+               <button onClick={runAnalysis} disabled={loading || !marketData || windowHistory.length === 0} className="p-3 bg-sky-500/10 hover:bg-sky-500/20 rounded-2xl transition-all active:scale-90 disabled:opacity-20 shadow-lg">
+                 <ICONS.Activity className={`text-sky-400 ${loading ? 'animate-spin' : ''}`} />
+               </button>
             </div>
 
             {loading ? (
-              <div className="flex-1 flex flex-col items-center justify-center space-y-8 py-12 text-center">
-                <div className="relative w-24 h-24">
-                  <div className="absolute inset-0 border-4 border-sky-500/5 rounded-full"></div>
-                  <div className="absolute inset-0 border-4 border-sky-500 border-t-transparent rounded-full animate-spin"></div>
-                </div>
-                <div className="space-y-3">
-                  <p className="text-white text-xs font-black uppercase tracking-[0.5em]">Deep Thinking Mode</p>
-                  <p className="text-slate-600 text-[10px] font-mono animate-pulse uppercase tracking-widest">
-                    Synthesizing Dealer Positioning & Reasoning...
-                  </p>
-                </div>
+              <div className="flex-1 flex flex-col items-center justify-center text-center space-y-4 relative z-10">
+                 <div className="w-12 h-12 border-4 border-sky-500 border-t-transparent rounded-full animate-spin" />
+                 <p className="text-[10px] text-slate-500 font-mono uppercase tracking-[0.3em]">Voting Ensemble...</p>
               </div>
             ) : analysis ? (
-              <div className="flex-1 space-y-8 animate-in fade-in duration-700">
-                <div className="flex items-center justify-between">
-                  <span className={`text-[10px] font-mono border-2 px-3 py-1.5 rounded-lg font-black tracking-[0.2em] uppercase ${getSignalBadge(analysis.signal.type)}`}>
-                    {analysis.signal.type}
-                  </span>
-                  <div className="text-right">
-                     <span className="block text-[10px] text-slate-500 font-bold uppercase tracking-widest mb-1">Confidence</span>
-                     <span className="text-sm text-sky-400 font-mono font-bold tracking-tighter">{(analysis.signal.confidence * 100).toFixed(0)}%</span>
-                  </div>
-                </div>
-
-                <div className="space-y-6">
-                  <div className="space-y-2">
-                    <span className="text-[10px] text-slate-500 uppercase tracking-[0.4em] font-bold flex items-center gap-2">
-                      Structural Zone
+              <div className="space-y-6 flex-1 relative z-10 animate-in fade-in slide-in-from-bottom-4 duration-500">
+                 <div className="bg-slate-950/80 p-6 rounded-2xl border border-slate-800 text-center space-y-3 shadow-inner">
+                    <span className="text-[10px] text-slate-600 uppercase tracking-widest font-black block">Consensus Confidence</span>
+                    <span className={`text-4xl font-black mono tracking-tighter transition-colors ${
+                      analysis.signal.voteCount >= 70 ? (analysis.signal.type === 'BUY' ? 'text-emerald-400' : 'text-rose-400') : 'text-sky-400'
+                    }`}>
+                      {analysis.signal.voteCount}/100
                     </span>
-                    <div className="bg-sky-500/5 border border-sky-500/20 p-4 rounded-2xl">
-                       <span className="text-lg font-black neon-text-blue uppercase tracking-tight block">
-                         {analysis.signal.liquidityZone || "Stable Flow Zone"}
-                       </span>
+                    <div className="w-full bg-slate-900 h-2 rounded-full mt-2 overflow-hidden border border-slate-800 relative">
+                       <div className={`h-full transition-all duration-1000 ${
+                         analysis.signal.voteCount >= 70 ? (analysis.signal.type === 'BUY' ? 'bg-emerald-500' : 'bg-rose-500') : 'bg-sky-500'
+                       }`} style={{ width: `${analysis.signal.voteCount}%` }} />
                     </div>
-                  </div>
+                 </div>
 
-                  <div className="bg-slate-950/80 p-6 rounded-2xl border border-slate-800 space-y-5 shadow-inner">
-                    <div className="flex justify-between items-center border-b border-slate-800/50 pb-4">
-                      <span className="text-[10px] text-slate-500 uppercase tracking-[0.2em] font-black font-mono">Entry</span>
-                      <span className="text-3xl font-bold mono text-sky-400 tracking-tighter">${analysis.signal.entry.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
+                 <div className="bg-slate-950 p-4 rounded-xl border border-slate-800 space-y-4 shadow-inner relative">
+                    {analysis.signal.executionStatus === 'SIT OUT' && (
+                       <div className="absolute inset-0 bg-slate-950/60 backdrop-blur-[2px] z-20 flex items-center justify-center rounded-xl">
+                          <span className="text-[9px] font-black uppercase text-amber-500 tracking-widest bg-amber-500/10 px-3 py-1 border border-amber-500/20 rounded-full">Wait for Pivot Setup</span>
+                       </div>
+                    )}
+                    <div className="flex justify-between items-center pb-3 border-b border-slate-900 text-[10px]">
+                       <span className="text-slate-600 uppercase font-black">Entry Trigger</span>
+                       <span className="font-bold mono text-white">${(analysis.signal.entry || 0).toFixed(2)}</span>
                     </div>
-                    <div className="grid grid-cols-2 gap-4">
-                      <div className="bg-rose-500/5 p-4 rounded-xl border border-rose-500/10 space-y-1">
-                        <span className="block text-[9px] text-rose-400/60 uppercase font-black tracking-widest font-mono">Stop</span>
-                        <span className="text-base font-bold text-rose-400 mono tracking-tighter">${analysis.signal.stopLoss.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
-                      </div>
-                      <div className="bg-emerald-500/5 p-4 rounded-xl border border-emerald-500/10 space-y-1">
-                        <span className="block text-[9px] text-emerald-400/60 uppercase font-black tracking-widest font-mono">Profit</span>
-                        <span className="text-base font-bold text-emerald-400 mono tracking-tighter">${analysis.signal.takeProfit.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
-                      </div>
+                    <div className="grid grid-cols-2 gap-3">
+                       <div className="bg-rose-500/5 p-3 rounded-lg border border-rose-500/10 text-center">
+                          <span className="text-[7px] text-rose-500 block uppercase mb-1">Stop Loss</span>
+                          <span className="text-xs font-bold text-rose-500">${(analysis.signal.stopLoss || 0).toFixed(2)}</span>
+                       </div>
+                       <div className="bg-emerald-500/5 p-3 rounded-lg border border-emerald-500/10 text-center">
+                          <span className="text-[7px] text-emerald-400 block uppercase mb-1">Target TP</span>
+                          <span className="text-xs font-bold text-emerald-400">${(analysis.signal.takeProfit || 0).toFixed(2)}</span>
+                       </div>
                     </div>
-                  </div>
+                 </div>
 
-                  <div className="space-y-3">
-                    <span className="text-[10px] text-slate-500 uppercase tracking-[0.4em] font-bold flex items-center gap-2">Thesis</span>
-                    <p className="text-sm text-slate-300 leading-relaxed italic font-medium bg-slate-900/40 p-5 rounded-2xl border border-slate-800/50 font-mono">
+                 <div className="space-y-2">
+                    <div className="flex items-center gap-2 px-1">
+                       <ICONS.Info size={10} className="text-sky-400" />
+                       <span className="text-[8px] text-slate-700 uppercase font-black tracking-widest">Protocol Stream</span>
+                    </div>
+                    <p className={`text-[11px] leading-relaxed italic font-mono p-4 rounded-xl border border-dashed ${
+                       analysis.signal.executionStatus === 'SIT OUT' ? 'text-amber-400 bg-amber-500/5 border-amber-500/20' : 'text-slate-400 bg-slate-900/40 border-slate-800'
+                    }`}>
                       "{analysis.signal.reasoning}"
                     </p>
-                  </div>
-                </div>
-
-                <div className="mt-auto pt-8 text-[9px] text-slate-700 flex justify-between font-mono uppercase tracking-[0.4em] font-bold">
-                  <span>Logic_v6.5.DEEP</span>
-                  <span>{lastUpdate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
-                </div>
+                 </div>
               </div>
             ) : (
-              <div className="flex-1 flex flex-col items-center justify-center text-slate-600 text-center space-y-8 py-10">
-                <div className="p-8 bg-slate-900/50 rounded-full border border-slate-800 opacity-20">
-                  <ICONS.Info size={48} />
-                </div>
-                <div className="space-y-3">
-                  <p className="text-[10px] font-mono uppercase tracking-[0.6em] text-slate-500 font-black">Ready for Flow Synthesis</p>
-                  <p className="text-[10px] text-slate-700 italic max-w-[220px] mx-auto uppercase tracking-widest leading-loose font-mono">
-                    Awaiting trigger for structural flow analysis of {selectedSymbol}.
-                  </p>
-                </div>
-                <button 
-                  onClick={runAnalysis}
-                  disabled={!marketData || fetchingData}
-                  className="group relative px-12 py-4 overflow-hidden rounded-2xl transition-all duration-300 active:scale-95 disabled:opacity-30"
-                >
-                  <div className="absolute inset-0 bg-sky-500" />
-                  <span className="relative z-10 text-white text-[11px] font-black uppercase tracking-[0.4em]">
-                    {fetchingData ? 'BUFFERING...' : 'INVOKE_ORACLE'}
-                  </span>
-                </button>
+              <div className="flex-1 flex flex-col items-center justify-center text-slate-600 opacity-20 py-20 relative z-10">
+                 <ICONS.Shield size={64} className="mb-6" />
+                 <p className="text-[10px] uppercase tracking-[0.6em] font-black text-center px-4">
+                   {windowHistory.length === 0 ? 'Synchronizing LOB Windows...' : 'Oracle Ready'}
+                 </p>
               </div>
             )}
+            
+            <div className="mt-auto pt-8 flex justify-between text-[8px] text-slate-700 font-black uppercase tracking-widest font-mono relative z-10 border-t border-slate-900/50">
+               <span>Rolling_Retrain_v2.3.4</span>
+               <span className="text-sky-500">{lastUpdate.toLocaleTimeString()}</span>
+            </div>
           </div>
         </div>
       </div>
-
-      <section className="relative z-10 pt-10">
-        <div className="flex items-center justify-between mb-8">
-          <div className="space-y-1">
-             <h2 className="text-xl font-black text-white tracking-tighter uppercase flex items-center gap-3">
-               <ICONS.Shield className="text-sky-500 w-5 h-5" />
-               Signal Ledger
-             </h2>
-             <p className="text-slate-500 text-[9px] uppercase tracking-[0.3em] font-mono">Historical Output Archives</p>
-          </div>
-          <button 
-            onClick={clearHistory}
-            className="text-[9px] font-black text-rose-500/50 hover:text-rose-500 transition-colors uppercase tracking-[0.2em] border border-rose-500/10 px-4 py-2 rounded-xl"
-          >
-            [Purge History]
-          </button>
-        </div>
-
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-          {signalHistory.length === 0 ? (
-            <div className="col-span-full py-12 border-2 border-dashed border-slate-900 rounded-3xl flex flex-col items-center justify-center gap-3 opacity-30">
-              <ICONS.Info size={24} className="text-slate-700" />
-              <p className="text-[10px] font-mono uppercase tracking-[0.4em] text-slate-700 font-black">Ledger Empty</p>
-            </div>
-          ) : (
-            signalHistory.map((entry) => (
-              <div key={entry.id} className="glass-effect rounded-2xl p-5 border border-slate-800/40 hover:border-sky-500/30 transition-all group">
-                <div className="flex justify-between items-start mb-4">
-                  <div className="space-y-1">
-                    <span className="block text-[10px] font-black text-white group-hover:text-sky-400 transition-colors">{entry.symbol}</span>
-                    <span className="block text-[8px] text-slate-500 font-mono">{new Date(entry.timestamp).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span>
-                  </div>
-                  <span className={`text-[8px] px-2 py-0.5 rounded border font-black tracking-widest ${getSignalBadge(entry.type)}`}>
-                    {entry.type}
-                  </span>
-                </div>
-                
-                <div className="grid grid-cols-2 gap-3 mb-4">
-                  <div className="bg-slate-950/50 p-2 rounded-lg border border-slate-900/50">
-                    <span className="block text-[7px] text-slate-600 uppercase font-black tracking-widest mb-1">Conf</span>
-                    <span className="text-[10px] text-sky-400 font-mono font-bold">{(entry.confidence * 100).toFixed(0)}%</span>
-                  </div>
-                  <div className="bg-slate-950/50 p-2 rounded-lg border border-slate-900/50">
-                    <span className="block text-[7px] text-slate-600 uppercase font-black tracking-widest mb-1">Entry</span>
-                    <span className="text-[10px] text-white font-mono font-bold">${entry.entry.toLocaleString(undefined, { maximumFractionDigits: 2 })}</span>
-                  </div>
-                </div>
-
-                <div className="text-[9px] text-slate-400 line-clamp-2 leading-relaxed italic font-mono opacity-60">
-                  "{entry.reasoning}"
-                </div>
-              </div>
-            ))
-          )}
-        </div>
-      </section>
-
-      <footer className="mt-20 text-center pb-16 border-t border-slate-950 pt-16 relative z-10">
-        <div className="flex flex-wrap justify-center gap-16 mb-10 opacity-30 grayscale hover:grayscale-0 hover:opacity-100 transition-all duration-700">
-          <div className="flex items-center gap-3">
-             <ICONS.Shield size={18} className="text-sky-400" />
-             <span className="text-[11px] font-mono text-slate-400 uppercase tracking-[0.4em] font-black">Prop Risk Filter</span>
-          </div>
-          <div className="flex items-center gap-3">
-             <ICONS.Zap size={18} className="text-amber-400" />
-             <span className="text-[11px] font-mono text-slate-400 uppercase tracking-[0.4em] font-black">Flow Architecture</span>
-          </div>
-          <div className="flex items-center gap-3">
-             <ICONS.Activity size={18} className="text-emerald-400" />
-             <span className="text-[11px] font-mono text-slate-400 uppercase tracking-[0.4em] font-black">EST Timezone</span>
-          </div>
-        </div>
-        <div className="space-y-4">
-          <p className="text-slate-800 text-[10px] max-w-2xl mx-auto leading-relaxed uppercase tracking-[0.6em] font-black opacity-40 font-mono">
-            Aether Quant | High-Frequency Liquidity Protocol v1.6.5
-          </p>
-          <div className="flex justify-center gap-6">
-            <button 
-              onClick={() => setShowVault(true)}
-              className="text-[9px] font-bold text-sky-500/50 hover:text-sky-500 transition-colors uppercase tracking-widest border border-sky-500/20 px-6 py-2 rounded-full font-mono"
-            >
-              [Edit Credentials]
-            </button>
-          </div>
-        </div>
-      </footer>
     </div>
   );
 };

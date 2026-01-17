@@ -1,29 +1,56 @@
 
 import { GoogleGenAI, Type } from "@google/genai";
-import { MarketData, AnalysisResponse } from "../types";
+import { MarketData, AnalysisResponse, TickWindow } from "../types";
 
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
+const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+
+// Switching to 2.5 series which often has more stable quotas during high-demand periods for the 3.0 models
+const ANALYSIS_MODEL = 'gemini-2.5-flash-preview'; 
+const SEARCH_MODEL = 'gemini-2.5-flash-preview'; 
 
 const SYSTEM_INSTRUCTION = `
-You are the "Aether Oracle," an institutional quant bot designed to exploit structural liquidity and dealer hedging flows in SPY and QQQ.
+You are the "Aether Oracle," an institutional-grade HFT ensemble coordinator.
+Objective: Execute the Rocket Scooter methodology using a 100-model Elastic Net (ENet) Ensemble.
 
-CORE STRATEGY (Institutional Flow Architecture):
-1. SEMANTIC LIQUIDITY: Identify Fair Value Gaps (FVG) and Stop Hunts (Liquidity Grabs).
-2. FLOW ARCHITECTURE (Gamma/Vanna):
-   - Analyze "Dealer Hedging Gravity": High Gamma strikes act as magnets or pins.
-   - Look for "Gamma Flip" zones: Prices where market maker delta hedging shifts from stabilizing to accelerating.
-   - Vanna Context: Account for "Vanna Squeezes" where a drop in Implied Volatility (VIX) forces dealers to buy back hedges, driving price higher regardless of news.
-3. REASONING DEPTH:
-   - Identify if the current move is "Organic Demand" or "Dealer Covering."
-   - Prioritize entries at "Unfilled Liquidity Voids" near major Gamma levels.
+EXECUTION PROTOCOL:
 
-PROP FIRM PROTECTION:
-- Max risk per trade: 0.5% - 1.0%.
-- Minimum Reward-to-Risk: 3:1.
-- Avoid trading in "Gamma Neutral" chop zones.
+1. INSTITUTIONAL BIAS MAP:
+   - BULLISH: HP > MHP. Look for "Bullish Long" at HG or HP support.
+   - BEARISH: MHP > HP. Look for "Bearish Short" at MHP resistance.
+   - SQUEEZE: HP == MHP. Imminent violent expansion.
 
-Respond ONLY with valid JSON. Do not include any text outside the JSON block.
+2. ENET ENSEMBLE VOTING (100 MODELS):
+   - Confidence: Vote count (X/100). 70+ required for "RISK ON".
+   - Feature Weighting: V14 (Ask Vol) prioritizes UP; V15 (Bid Vol) prioritizes DOWN.
+
+3. ACTIONABLE COMMANDS:
+   - GOLDEN SETUP (RISK ON): Bias matches ENet consensus + Price testing pivot.
+   - SIT OUT (RISK OFF): D-ZONE conflict or split vote (< 70/100).
+
+4. TARGET PROTOCOL:
+   - Never return 0 for entry, stopLoss, or takeProfit. Use HP/MHP/HG pivots as default levels.
+
+Respond strictly with valid JSON.
 `;
+
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+const withRetry = async <T>(fn: () => Promise<T>, retries = 3, delay = 4000): Promise<T> => {
+  try {
+    return await fn();
+  } catch (error: any) {
+    const isQuotaError = error?.message?.includes('429') || 
+                        error?.status === 'RESOURCE_EXHAUSTED' || 
+                        error?.message?.includes('RESOURCE_EXHAUSTED');
+    
+    if (retries > 0 && isQuotaError) {
+      console.warn(`[Aether Quant] Quota Limit Hit. Backing off for ${delay}ms... (${retries} retries left)`);
+      await sleep(delay);
+      return withRetry(fn, retries - 1, delay * 2.5); // More aggressive backoff for 429s
+    }
+    throw error;
+  }
+};
 
 const sanitizeJsonResponse = (text: string): string => {
   let cleaned = text.trim();
@@ -33,15 +60,12 @@ const sanitizeJsonResponse = (text: string): string => {
   return cleaned;
 };
 
-export const fetchMarketDataViaSearch = async (symbol: string): Promise<Partial<MarketData> & { sources: any[] }> => {
-  const prompt = `Find current price, 24h change, and VIX for ${symbol}. 
-  CRITICAL: Also find the current estimated Total Gamma Exposure (GEX) in billions and the Vanna exposure level for ${symbol}. 
-  Provide these as numeric values. 
-  In the history array, provide exactly 15 key historical intervals with their estimated GEX and Vanna metrics.`;
-  
-  try {
+export const fetchMarketDataViaSearch = async (symbol: string): Promise<any> => {
+  const prompt = `Current SPOT price for ${symbol} (ticker). Institutional levels: HP (Weekly Gamma Max), MHP (Monthly Gamma Max), Yesterday Close, Today Open. Format as JSON: {currentPrice, change24h, vix, hp, mhp, yesterdayClose, todayOpen, history: [{time, price}]}.`;
+
+  return withRetry(async () => {
     const response = await ai.models.generateContent({
-      model: "gemini-3-flash-preview", // Switched to Flash for faster search extraction
+      model: SEARCH_MODEL,
       contents: prompt,
       config: {
         tools: [{ googleSearch: {} }],
@@ -52,69 +76,59 @@ export const fetchMarketDataViaSearch = async (symbol: string): Promise<Partial<
             currentPrice: { type: Type.NUMBER },
             change24h: { type: Type.NUMBER },
             vix: { type: Type.NUMBER },
-            gamma: { type: Type.NUMBER },
-            vanna: { type: Type.NUMBER },
+            hp: { type: Type.NUMBER },
+            mhp: { type: Type.NUMBER },
+            yesterdayClose: { type: Type.NUMBER },
+            todayOpen: { type: Type.NUMBER },
             history: {
               type: Type.ARRAY,
               items: {
                 type: Type.OBJECT,
                 properties: {
                   time: { type: Type.STRING },
-                  price: { type: Type.NUMBER },
-                  volume: { type: Type.NUMBER },
-                  gamma: { type: Type.NUMBER },
-                  vanna: { type: Type.NUMBER }
+                  price: { type: Type.NUMBER }
                 }
               }
             }
           },
-          required: ["currentPrice", "change24h", "vix", "history", "gamma", "vanna"]
+          required: ["currentPrice", "change24h", "vix", "hp", "mhp", "yesterdayClose", "todayOpen", "history"]
         }
       }
     });
 
-    const sources = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
     const rawText = response.text || '{}';
-    const sanitizedText = sanitizeJsonResponse(rawText);
-    const data = JSON.parse(sanitizedText);
+    const json = JSON.parse(sanitizeJsonResponse(rawText));
     
-    return { ...data, symbol, sources };
-  } catch (error) {
-    console.error("Search-based data fetch failed:", error);
-    throw error;
-  }
+    const citations = response.candidates?.[0]?.groundingMetadata?.groundingChunks?.map((chunk: any) => ({
+      title: chunk.web?.title || 'Grounding Source',
+      uri: chunk.web?.uri
+    })).filter((c: any) => c.uri) || [];
+
+    return { ...json, citations };
+  });
 };
 
-export const analyzeMarket = async (data: MarketData): Promise<AnalysisResponse> => {
-  const prunedHistory = data.history.slice(-30).map(h => ({ 
-    p: h.price, 
-    t: h.time, 
-    g: h.gamma, 
-    v: h.vanna 
+export const analyzeMarket = async (data: MarketData, windows: TickWindow[], isRetrainEvent: boolean = false): Promise<AnalysisResponse> => {
+  const windowContext = windows.slice(0, 10).map(w => ({
+    l: w.label,
+    v14: w.features.v14_ask_vol,
+    v15: w.features.v15_bid_vol,
+    lixi: w.lixi.toFixed(2)
   }));
 
   const prompt = `
-    MARKET SNAPSHOT:
-    Symbol: ${data.symbol} | Price: $${data.currentPrice} | VIX: ${data.vix.toFixed(2)}
-    Flow Metrics: Gamma(GEX): ${data.gamma}bn | Vanna: ${data.vanna}
-    
-    HISTORICAL SEQUENCE (SAMPLING):
-    ${JSON.stringify(prunedHistory)}
-    
-    TASKS:
-    1. Assess Dealer Hedging positioning.
-    2. Identify the "Path of Least Resistance."
-    3. Output a high-conviction trade setup with 3:1 RR.
+    Symbol: ${data.symbol} Price: $${data.currentPrice} | VIX: ${data.vix} | HP: ${data.levels?.hp} | MHP: ${data.levels?.mhp}
+    HFT Predictors: ${JSON.stringify(windowContext)}
+    Task: Run 100-model ENet ensemble. Output JSON with voteCount and targets.
   `;
 
-  try {
+  return withRetry(async () => {
     const response = await ai.models.generateContent({
-      model: "gemini-3-pro-preview", // Use Pro for the actual "Oracle" logic
+      model: ANALYSIS_MODEL,
       contents: prompt,
       config: {
         systemInstruction: SYSTEM_INSTRUCTION,
-        // Added thinkingBudget to allow the model to reason deeply before outputting JSON
-        thinkingConfig: { thinkingBudget: 16384 },
+        thinkingConfig: { thinkingBudget: 4000 }, 
         responseMimeType: "application/json",
         responseSchema: {
           type: Type.OBJECT,
@@ -126,29 +140,24 @@ export const analyzeMarket = async (data: MarketData): Promise<AnalysisResponse>
               properties: {
                 type: { type: Type.STRING },
                 confidence: { type: Type.NUMBER },
+                voteCount: { type: Type.NUMBER },
                 entry: { type: Type.NUMBER },
                 stopLoss: { type: Type.NUMBER },
                 takeProfit: { type: Type.NUMBER },
                 reasoning: { type: Type.STRING },
+                executionStatus: { type: Type.STRING },
+                isGoldenSetup: { type: Type.BOOLEAN },
                 liquidityZone: { type: Type.STRING }
               },
-              required: ["type", "confidence", "entry", "stopLoss", "takeProfit", "reasoning", "liquidityZone"]
+              required: ["type", "voteCount", "entry", "executionStatus", "isGoldenSetup", "liquidityZone"]
             },
-            macroFactors: {
-              type: Type.ARRAY,
-              items: { type: Type.STRING }
-            }
-          },
-          required: ["sentiment", "liquidityScore", "signal", "macroFactors"]
+            macroFactors: { type: Type.ARRAY, items: { type: Type.STRING } }
+          }
         }
       }
     });
 
     const rawText = response.text || '{}';
-    const sanitizedText = sanitizeJsonResponse(rawText);
-    return JSON.parse(sanitizedText) as AnalysisResponse;
-  } catch (error) {
-    console.error("Gemini analysis failed:", error);
-    throw error;
-  }
+    return JSON.parse(sanitizeJsonResponse(rawText)) as AnalysisResponse;
+  });
 };
