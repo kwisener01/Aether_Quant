@@ -57,6 +57,9 @@ export interface InstitutionalLevels {
   hp: number; // Weekly Max Gamma
   mhp: number; // Monthly Max Gamma
   hg: number; // Half Gap
+  gammaFlip: number; // Gamma Flip Level
+  maxGamma: number; // Max Gamma Concentration
+  vannaPivot: number; // Vanna Hedging Pivot
   bias: 'BULLISH' | 'BEARISH' | 'NEUTRAL' | 'SQUEEZE';
 }
 

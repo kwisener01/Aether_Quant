@@ -2,66 +2,57 @@
 import { GoogleGenAI, Type } from "@google/genai";
 import { MarketData, AnalysisResponse, TickWindow } from "../types";
 
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-
-// Switching to 2.5 series which often has more stable quotas during high-demand periods for the 3.0 models
-const ANALYSIS_MODEL = 'gemini-2.5-flash-preview'; 
-const SEARCH_MODEL = 'gemini-2.5-flash-preview'; 
+const ANALYSIS_MODEL = 'gemini-3-pro-image-preview'; 
+const SEARCH_MODEL = 'gemini-3-pro-image-preview'; 
 
 const SYSTEM_INSTRUCTION = `
 You are the "Aether Oracle," an institutional-grade HFT ensemble coordinator.
 Objective: Execute the Rocket Scooter methodology using a 100-model Elastic Net (ENet) Ensemble.
 
 EXECUTION PROTOCOL:
+1. BULLISH: HP > MHP. 
+2. BEARISH: MHP > HP. 
+3. SQUEEZE: HP == MHP.
+4. CONFIDENCE: Vote count (X/100). 70+ required for "RISK ON".
 
-1. INSTITUTIONAL BIAS MAP:
-   - BULLISH: HP > MHP. Look for "Bullish Long" at HG or HP support.
-   - BEARISH: MHP > HP. Look for "Bearish Short" at MHP resistance.
-   - SQUEEZE: HP == MHP. Imminent violent expansion.
-
-2. ENET ENSEMBLE VOTING (100 MODELS):
-   - Confidence: Vote count (X/100). 70+ required for "RISK ON".
-   - Feature Weighting: V14 (Ask Vol) prioritizes UP; V15 (Bid Vol) prioritizes DOWN.
-
-3. ACTIONABLE COMMANDS:
-   - GOLDEN SETUP (RISK ON): Bias matches ENet consensus + Price testing pivot.
-   - SIT OUT (RISK OFF): D-ZONE conflict or split vote (< 70/100).
-
-4. TARGET PROTOCOL:
-   - Never return 0 for entry, stopLoss, or takeProfit. Use HP/MHP/HG pivots as default levels.
-
-Respond strictly with valid JSON.
+Respond ONLY with valid JSON inside a code block.
 `;
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-const withRetry = async <T>(fn: () => Promise<T>, retries = 3, delay = 4000): Promise<T> => {
+const sanitizeJsonResponse = (text: string): string => {
+  let cleaned = text.trim();
+  // Handle markdown code blocks if present
+  if (cleaned.includes('```')) {
+    const matches = cleaned.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+    if (matches && matches[1]) {
+      cleaned = matches[1].trim();
+    }
+  }
+  const startIdx = cleaned.indexOf('{');
+  const endIdx = cleaned.lastIndexOf('}');
+  if (startIdx !== -1 && endIdx !== -1) {
+    cleaned = cleaned.substring(startIdx, endIdx + 1);
+  }
+  return cleaned;
+};
+
+const withRetry = async <T>(fn: () => Promise<T>, retries = 3, delay = 3000): Promise<T> => {
   try {
     return await fn();
   } catch (error: any) {
-    const isQuotaError = error?.message?.includes('429') || 
-                        error?.status === 'RESOURCE_EXHAUSTED' || 
-                        error?.message?.includes('RESOURCE_EXHAUSTED');
-    
-    if (retries > 0 && isQuotaError) {
-      console.warn(`[Aether Quant] Quota Limit Hit. Backing off for ${delay}ms... (${retries} retries left)`);
+    const errorMsg = error?.message?.toLowerCase() || "";
+    if (retries > 0 && (errorMsg.includes('429') || errorMsg.includes('resource_exhausted'))) {
       await sleep(delay);
-      return withRetry(fn, retries - 1, delay * 2.5); // More aggressive backoff for 429s
+      return withRetry(fn, retries - 1, delay * 2);
     }
     throw error;
   }
 };
 
-const sanitizeJsonResponse = (text: string): string => {
-  let cleaned = text.trim();
-  if (cleaned.startsWith('```')) {
-    cleaned = cleaned.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
-  }
-  return cleaned;
-};
-
 export const fetchMarketDataViaSearch = async (symbol: string): Promise<any> => {
-  const prompt = `Current SPOT price for ${symbol} (ticker). Institutional levels: HP (Weekly Gamma Max), MHP (Monthly Gamma Max), Yesterday Close, Today Open. Format as JSON: {currentPrice, change24h, vix, hp, mhp, yesterdayClose, todayOpen, history: [{time, price}]}.`;
+  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+  const prompt = `Search for current ${symbol} data. Provide: currentPrice, change24h, vix. Institutional Levels: hp (Weekly Gamma Max), mhp (Monthly Gamma Max), gammaFlip, maxGamma, vannaPivot, yesterdayClose, todayOpen. Return JSON ONLY.`;
 
   return withRetry(async () => {
     const response = await ai.models.generateContent({
@@ -69,46 +60,29 @@ export const fetchMarketDataViaSearch = async (symbol: string): Promise<any> => 
       contents: prompt,
       config: {
         tools: [{ googleSearch: {} }],
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            currentPrice: { type: Type.NUMBER },
-            change24h: { type: Type.NUMBER },
-            vix: { type: Type.NUMBER },
-            hp: { type: Type.NUMBER },
-            mhp: { type: Type.NUMBER },
-            yesterdayClose: { type: Type.NUMBER },
-            todayOpen: { type: Type.NUMBER },
-            history: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  time: { type: Type.STRING },
-                  price: { type: Type.NUMBER }
-                }
-              }
-            }
-          },
-          required: ["currentPrice", "change24h", "vix", "hp", "mhp", "yesterdayClose", "todayOpen", "history"]
-        }
+        // responseMimeType is not supported for gemini-3-pro-image-preview
       }
     });
 
     const rawText = response.text || '{}';
-    const json = JSON.parse(sanitizeJsonResponse(rawText));
-    
-    const citations = response.candidates?.[0]?.groundingMetadata?.groundingChunks?.map((chunk: any) => ({
-      title: chunk.web?.title || 'Grounding Source',
-      uri: chunk.web?.uri
-    })).filter((c: any) => c.uri) || [];
+    try {
+      const json = JSON.parse(sanitizeJsonResponse(rawText));
+      const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+      const citations = chunks.map((chunk: any) => ({
+        title: chunk.web?.title || 'Grounding Source',
+        uri: chunk.web?.uri
+      })).filter((c: any) => c.uri);
 
-    return { ...json, citations };
+      return { ...json, citations };
+    } catch (parseErr) {
+      console.error("Manual Parse Failure", rawText);
+      throw new Error("INVALID_SEARCH_FORMAT");
+    }
   });
 };
 
 export const analyzeMarket = async (data: MarketData, windows: TickWindow[], isRetrainEvent: boolean = false): Promise<AnalysisResponse> => {
+  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
   const windowContext = windows.slice(0, 10).map(w => ({
     l: w.label,
     v14: w.features.v14_ask_vol,
@@ -116,10 +90,11 @@ export const analyzeMarket = async (data: MarketData, windows: TickWindow[], isR
     lixi: w.lixi.toFixed(2)
   }));
 
-  const prompt = `
-    Symbol: ${data.symbol} Price: $${data.currentPrice} | VIX: ${data.vix} | HP: ${data.levels?.hp} | MHP: ${data.levels?.mhp}
+  const prompt = `${SYSTEM_INSTRUCTION}
+    Data: Symbol: ${data.symbol} Price: ${data.currentPrice} VIX: ${data.vix}
+    Levels: GF: ${data.levels?.gammaFlip}, HP: ${data.levels?.hp}, VP: ${data.levels?.vannaPivot}
     HFT Predictors: ${JSON.stringify(windowContext)}
-    Task: Run 100-model ENet ensemble. Output JSON with voteCount and targets.
+    Required Output JSON: { sentiment, liquidityScore, signal: { type: 'BUY'|'SELL'|'WAIT', voteCount, entry, stopLoss, takeProfit, reasoning, executionStatus: 'RISK ON'|'SIT OUT', isGoldenSetup, liquidityZone }, macroFactors: [] }
   `;
 
   return withRetry(async () => {
@@ -127,33 +102,7 @@ export const analyzeMarket = async (data: MarketData, windows: TickWindow[], isR
       model: ANALYSIS_MODEL,
       contents: prompt,
       config: {
-        systemInstruction: SYSTEM_INSTRUCTION,
-        thinkingConfig: { thinkingBudget: 4000 }, 
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            sentiment: { type: Type.STRING },
-            liquidityScore: { type: Type.NUMBER },
-            signal: {
-              type: Type.OBJECT,
-              properties: {
-                type: { type: Type.STRING },
-                confidence: { type: Type.NUMBER },
-                voteCount: { type: Type.NUMBER },
-                entry: { type: Type.NUMBER },
-                stopLoss: { type: Type.NUMBER },
-                takeProfit: { type: Type.NUMBER },
-                reasoning: { type: Type.STRING },
-                executionStatus: { type: Type.STRING },
-                isGoldenSetup: { type: Type.BOOLEAN },
-                liquidityZone: { type: Type.STRING }
-              },
-              required: ["type", "voteCount", "entry", "executionStatus", "isGoldenSetup", "liquidityZone"]
-            },
-            macroFactors: { type: Type.ARRAY, items: { type: Type.STRING } }
-          }
-        }
+        thinkingConfig: { thinkingBudget: 4000 }
       }
     });
 
