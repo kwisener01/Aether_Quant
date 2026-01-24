@@ -10,8 +10,7 @@ import {
   ResponsiveContainer,
   ReferenceDot,
   ReferenceLine,
-  Label,
-  ComposedChart
+  Label
 } from 'recharts';
 import { PricePoint, HistoricalSignal, MarketData, TickWindow, TickLabel } from '../types';
 
@@ -41,9 +40,9 @@ const CustomTooltip = ({ active, payload, label }: any) => {
         <div className="space-y-2 md:space-y-3">
           <div className="flex justify-between items-center">
             <span className="text-[8px] md:text-[10px] font-black text-slate-500 uppercase tracking-widest">Price</span>
-            <span className="text-sky-400 font-black font-mono text-xs md:text-sm">${price?.toFixed(2)}</span>
+            <span className="text-sky-400 font-black font-mono text-xs md:text-sm">${typeof price === 'number' ? price.toFixed(2) : '0.00'}</span>
           </div>
-          {lixi !== undefined && (
+          {typeof lixi === 'number' && (
             <div className="space-y-1">
               <div className="flex justify-between items-center">
                 <span className="text-[8px] md:text-[10px] font-black text-slate-500 uppercase tracking-widest">Lixi Depth</span>
@@ -79,10 +78,11 @@ const MarketChart: React.FC<MarketChartProps> = ({ data, symbol, signals, levels
   const [tooltipPos, setTooltipPos] = useState({ x: 0, y: 0 });
 
   const mergedData = useMemo(() => {
+    if (!data.length) return [];
     return data.map((d, i) => {
       const flowIndex = Math.floor((i / data.length) * flowHistory.length);
       const win = flowHistory[flowHistory.length - 1 - flowIndex];
-      const lixiValue = win ? win.lixi : 0;
+      const lixiValue = win ? (win.lixi || 0) : 0;
       const label = win ? win.label : TickLabel.STATIONARY;
 
       return {
@@ -99,16 +99,19 @@ const MarketChart: React.FC<MarketChartProps> = ({ data, symbol, signals, levels
   const visibleSignals = signals.filter(s => s.symbol === symbol && data.some(d => d.time === s.chartTime));
 
   const yPriceDomain = useMemo(() => {
-    if (data.length === 0) return ['auto', 'auto'];
-    const prices = data.map(d => d.price);
+    if (!data.length) return [0, 100];
+    const prices = data.map(d => d.price).filter(p => typeof p === 'number' && !isNaN(p));
     const pivotValues = levels ? [
       levels.hp, levels.mhp, levels.gammaFlip, levels.maxGamma, levels.vannaPivot
-    ].filter(v => v > 0) : [];
+    ].filter(v => typeof v === 'number' && !isNaN(v) && v > 0) : [];
     
     const allValues = [...prices, ...pivotValues];
+    if (allValues.length === 0) return [0, 100];
+    
     const min = Math.min(...allValues);
     const max = Math.max(...allValues);
-    const padding = (max - min) * 0.1;
+    const range = max - min;
+    const padding = range === 0 ? 1 : range * 0.1;
     return [min - padding, max + padding];
   }, [data, levels]);
 
@@ -150,11 +153,11 @@ const MarketChart: React.FC<MarketChartProps> = ({ data, symbol, signals, levels
               isAnimationActive={false} 
             />
 
-            {levels?.gammaFlip && (
+            {levels?.gammaFlip ? (
               <ReferenceLine y={levels.gammaFlip} stroke="#22d3ee" strokeDasharray="4 4" strokeOpacity={0.3} strokeWidth={1}>
                 <Label value="GF" position="insideRight" fill="#22d3ee" fontSize={7} fontWeight="900" />
               </ReferenceLine>
-            )}
+            ) : null}
 
             {visibleSignals.map((signal) => (
               <ReferenceDot 

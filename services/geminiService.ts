@@ -1,8 +1,7 @@
 
-import { GoogleGenAI, Type } from "@google/genai";
+import { GoogleGenAI } from "@google/genai";
 import { MarketData, AnalysisResponse, TickWindow, SentimentAnalysis } from "../types";
 
-// Using Flash for search-heavy tasks to prevent "spinning" latency
 const SEARCH_MODEL = 'gemini-3-flash-preview'; 
 const ANALYSIS_MODEL = 'gemini-3-pro-preview'; 
 
@@ -48,17 +47,9 @@ export const fetchMarketDataViaSearch = async (symbol: string): Promise<any> => 
   const prompt = `REAL-TIME QUANT DATA RETRIEVAL:
     Search for today's specific institutional levels for ${symbol}.
     1. Metrics: currentPrice, change24h, vix (CBOE Volatility Index).
-    2. Institutional Levels: 
-       - hp: "Weekly Call Wall" or "Max Gamma" price level.
-       - mhp: "Monthly Call Wall" or "Major Support/Resistance Gamma".
-       - gammaFlip: The price where gamma flips from positive to negative.
-       - maxGamma: Highest GEX concentration level.
-       - vannaPivot: The key vanna sensitivity level for today's expiration.
-       - yesterdayClose, todayOpen.
-    3. Historical Series: Provide a SUBSTANTIAL list (minimum 100-150 points) of 1-minute candle close prices for the ENTIRE CURRENT session.
-    
-    IMPORTANT: Return numbers as numbers, not strings. Ensure the JSON is valid.
-    Return JSON format only: 
+    2. Institutional Levels: hp, mhp, gammaFlip, maxGamma, vannaPivot, yesterdayClose, todayOpen.
+    3. Historical Series: Provide a list (minimum 100 points) of 1-minute candle close prices for the session.
+    JSON format only: 
     {
       "currentPrice": number,
       "change24h": number,
@@ -85,25 +76,19 @@ export const fetchMarketDataViaSearch = async (symbol: string): Promise<any> => 
     const rawText = response.text || '{}';
     try {
       const parsed = JSON.parse(sanitizeJsonResponse(rawText));
-      
-      // Robust conversion of all keys to Numbers to prevent .toFixed errors
       const numericKeys = ['currentPrice', 'change24h', 'vix', 'hp', 'mhp', 'gammaFlip', 'maxGamma', 'vannaPivot', 'yesterdayClose', 'todayOpen'];
       numericKeys.forEach(key => {
-        if (parsed[key] !== undefined) {
-          parsed[key] = parseFloat(parsed[key]) || 0;
-        }
+        parsed[key] = parseFloat(String(parsed[key])) || 0;
       });
-
       if (parsed.history && Array.isArray(parsed.history)) {
         parsed.history = parsed.history.map((h: any) => ({
           ...h,
-          price: parseFloat(h.price) || 0,
-          volume: parseFloat(h.volume) || (Math.floor(Math.random() * 5000) + 2000)
+          price: parseFloat(String(h.price)) || 0,
+          volume: parseFloat(String(h.volume)) || (Math.floor(Math.random() * 5000) + 2000)
         })).filter((h: any) => h.price > 0);
       }
       return parsed;
     } catch (parseErr) {
-      console.error("Search Grounding Parse Error", rawText);
       return { currentPrice: 0, history: [] };
     }
   });
@@ -111,17 +96,15 @@ export const fetchMarketDataViaSearch = async (symbol: string): Promise<any> => 
 
 export const fetchSentimentAnalysis = async (symbol: string): Promise<SentimentAnalysis> => {
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-  const prompt = `SEARCH AND ANALYZE: Current institutional and retail sentiment for ${symbol}. 
-    Look for news headlines from the last 6 hours, options order flow sentiment, and Bloomberg/Reuters alerts.
+  const prompt = `SEARCH AND ANALYZE: Current institutional sentiment for ${symbol}. 
     Return JSON format:
     {
-      "score": number (between -100 and 100),
+      "score": number,
       "label": "FEAR" | "EXTREME FEAR" | "NEUTRAL" | "GREED" | "EXTREME GREED",
       "headlines": [
         { "title": "Headline string", "sentiment": "BULLISH" | "BEARISH" | "NEUTRAL", "source": "Source name" }
       ]
-    }
-    Return 4 headlines total.`;
+    }`;
 
   return withRetry(async () => {
     const response = await ai.models.generateContent({
@@ -133,7 +116,9 @@ export const fetchSentimentAnalysis = async (symbol: string): Promise<SentimentA
     });
 
     try {
-      return JSON.parse(sanitizeJsonResponse(response.text || '{}')) as SentimentAnalysis;
+      const parsed = JSON.parse(sanitizeJsonResponse(response.text || '{}'));
+      parsed.score = parseFloat(String(parsed.score)) || 0;
+      return parsed as SentimentAnalysis;
     } catch (err) {
       return { score: 0, label: "NEUTRAL", headlines: [] };
     }
@@ -144,33 +129,14 @@ export const analyzeMarket = async (data: MarketData, windows: TickWindow[]): Pr
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
   const windowContext = windows.slice(0, 15).map(w => ({
     l: w.label,
-    v14: w.features.v14_ask_vol,
-    v15: w.features.v15_bid_vol,
-    lixi: w.lixi.toFixed(2)
+    lixi: (w.lixi || 0).toFixed(2)
   }));
 
   const prompt = `${SYSTEM_INSTRUCTION}
     Symbol: ${data.symbol} Price: ${data.currentPrice} VIX: ${data.vix}
-    Levels: GF: ${data.levels?.gammaFlip}, HP: ${data.levels?.hp}, VP: ${data.levels?.vannaPivot}, MG: ${data.levels?.maxGamma}
-    HFT Predictors (Last 15 Windows): ${JSON.stringify(windowContext)}
-    
-    Task: Calculate a high-probability trade setup. Focus on Lixi Flow clusters and Institutional Pinning at Levels.
-    
-    Return JSON: 
-    { 
-      sentiment, 
-      liquidityScore, 
-      signal: { 
-        type, voteCount, entry, stopLoss, takeProfit, reasoning, executionStatus, isGoldenSetup, liquidityZone,
-        ensembleInsights: [
-          { category: 'Order Flow Density', weight: 25, sentiment: 'BULLISH'|'BEARISH'|'NEUTRAL', description: 'string' },
-          { category: 'Gamma Gravity', weight: 25, sentiment: '...', description: '...' },
-          { category: 'Vanna Skew', weight: 25, sentiment: '...', description: '...' },
-          { category: 'Macro Pulse', weight: 25, sentiment: '...', description: '...' }
-        ]
-      }, 
-      macroFactors: [] 
-    }
+    Levels: GF: ${data.levels?.gammaFlip}, HP: ${data.levels?.hp}
+    Last Windows: ${JSON.stringify(windowContext)}
+    Calculate high-probability trade setup. Return JSON.
   `;
 
   return withRetry(async () => {
@@ -184,12 +150,11 @@ export const analyzeMarket = async (data: MarketData, windows: TickWindow[]): Pr
 
     try {
       const parsed = JSON.parse(sanitizeJsonResponse(response.text || '{}'));
-      // Sanitation for the signal numeric values to prevent toFixed crash
       if (parsed.signal) {
-        parsed.signal.entry = parseFloat(parsed.signal.entry) || 0;
-        parsed.signal.stopLoss = parseFloat(parsed.signal.stopLoss) || 0;
-        parsed.signal.takeProfit = parseFloat(parsed.signal.takeProfit) || 0;
-        parsed.signal.voteCount = parseInt(parsed.signal.voteCount) || 0;
+        parsed.signal.entry = parseFloat(String(parsed.signal.entry)) || 0;
+        parsed.signal.stopLoss = parseFloat(String(parsed.signal.stopLoss)) || 0;
+        parsed.signal.takeProfit = parseFloat(String(parsed.signal.takeProfit)) || 0;
+        parsed.signal.voteCount = parseInt(String(parsed.signal.voteCount)) || 0;
       }
       return parsed as AnalysisResponse;
     } catch (e) {

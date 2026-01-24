@@ -17,23 +17,29 @@ const generateSafeId = () => {
 };
 
 const formatToEST = (date: Date) => {
-  return date.toLocaleString('en-US', {
-    timeZone: 'America/New_York',
-    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
-  });
+  try {
+    return date.toLocaleString('en-US', {
+      timeZone: 'America/New_York',
+      hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+    });
+  } catch (e) {
+    return date.toLocaleTimeString();
+  }
 };
 
 const isMarketOpen = () => {
-  const now = new Date();
-  const estDate = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
-  const day = estDate.getDay();
-  const hour = estDate.getHours();
-  const min = estDate.getMinutes();
-  
-  if (day === 0 || day === 6) return false; // Weekend
-  
-  const timeInMins = hour * 60 + min;
-  return timeInMins >= 570 && timeInMins <= 960; // 9:30 AM to 4:00 PM
+  try {
+    const now = new Date();
+    const estDate = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+    const day = estDate.getDay();
+    const hour = estDate.getHours();
+    const min = estDate.getMinutes();
+    if (day === 0 || day === 6) return false;
+    const timeInMins = hour * 60 + min;
+    return timeInMins >= 570 && timeInMins <= 960; // 9:30 AM to 4:00 PM
+  } catch (e) {
+    return true; // Default to open if TZ check fails
+  }
 };
 
 type StreamingStatus = 'IDLE' | 'TRADIER_PRO' | 'GROUNDED' | 'OFFLINE' | 'TIMEOUT' | 'ERROR';
@@ -47,13 +53,11 @@ const App: React.FC = () => {
   const [analysis, setAnalysis] = useState<AnalysisResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [fetchingData, setFetchingData] = useState(false);
-  const [apiError, setApiError] = useState<'QUOTA' | 'TIMEOUT' | 'FETCH' | 'ANALYSIS' | null>(null);
   const [showVault, setShowVault] = useState(false);
   const [inputToken, setInputToken] = useState('');
   const [isSandbox, setIsSandbox] = useState(false);
   const [signalHistory, setSignalHistory] = useState<HistoricalSignal[]>([]);
   const [streamingStatus, setStreamingStatus] = useState<StreamingStatus>('IDLE');
-  const [lastRefresh, setLastRefresh] = useState<string>('NEVER');
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [countdown, setCountdown] = useState(30);
   
@@ -71,7 +75,7 @@ const App: React.FC = () => {
   const tradierRef = useRef<TradierService | null>(null);
   const fetchLock = useRef<boolean>(false);
 
-  const currentLixi = windowHistory.length > 0 ? windowHistory[0].lixi : 0;
+  const currentLixi = windowHistory.length > 0 ? (windowHistory[0].lixi || 0) : 0;
   const isGoldenFlow = currentLixi > 7.5;
   const marketLive = isMarketOpen();
 
@@ -85,11 +89,10 @@ const App: React.FC = () => {
 
   const fetchData = useCallback(async (forceSymbol?: string) => {
     const symbol = forceSymbol || selectedSymbol;
-    if (fetchLock.current && !forceSymbol) return;
+    if (fetchLock.current) return;
     
     fetchLock.current = true;
     setFetchingData(true);
-    setApiError(null);
     
     try {
       let historyPoints: PricePoint[] = [];
@@ -113,11 +116,11 @@ const App: React.FC = () => {
           if (bars && bars.length > 0) {
             historyPoints = bars.map(b => ({
               time: b.date.includes(' ') ? b.date.split(' ')[1] : b.date,
-              price: parseFloat(b.close.toString()),
-              volume: parseFloat(b.volume.toString())
+              price: parseFloat(String(b.close)) || 0,
+              volume: parseFloat(String(b.volume)) || 0
             }));
             dataSource = 'TRADIER_PRO';
-            currentPrice = quote[0]?.last || (historyPoints.length > 0 ? historyPoints[historyPoints.length - 1].price : 0);
+            currentPrice = parseFloat(String(quote[0]?.last)) || (historyPoints.length > 0 ? historyPoints[historyPoints.length - 1].price : 0);
           }
         } catch (err: any) {
           dataSource = 'GROUNDED';
@@ -126,19 +129,19 @@ const App: React.FC = () => {
       
       if (historyPoints.length === 0) {
         historyPoints = (searchMeta.history || []).map((h: any) => ({
-          time: h.time,
-          price: parseFloat(h.price) || 0,
-          volume: parseFloat(h.volume) || 0
+          time: String(h.time),
+          price: parseFloat(String(h.price)) || 0,
+          volume: parseFloat(String(h.volume)) || 0
         }));
       }
 
-      if (historyPoints.length === 0 || historyPoints[0].price === 0) {
+      if (historyPoints.length === 0 || (historyPoints.length > 0 && historyPoints[0].price === 0)) {
         setStreamingStatus('OFFLINE');
       } else {
         setStreamingStatus(dataSource);
         const service = tradierRef.current || new TradierService("");
         
-        const vixValue = parseFloat(searchMeta.vix) || 15;
+        const vixValue = parseFloat(String(searchMeta.vix)) || 15;
         const baseSpread = Math.max(0.01, (vixValue / 850)); 
         const marketActive = isMarketOpen();
 
@@ -147,7 +150,6 @@ const App: React.FC = () => {
           const noise = (Math.random() - 0.5) * (vixValue / 120) * openingVol;
           const currentSpread = baseSpread * (0.8 + Math.random() * 0.4);
           const tickVolume = (p.volume || 2500) * (0.5 + Math.random() * 1.5);
-          
           const cycle = Math.sin(idx / 10);
           const buySellSkew = 0.5 + (cycle * 0.25) + (Math.random() * 0.1 - 0.05);
 
@@ -182,8 +184,8 @@ const App: React.FC = () => {
         setWindowHistory(windows.reverse());
       }
 
-      const hp = parseFloat(searchMeta.hp) || 0;
-      const mhp = parseFloat(searchMeta.mhp) || 0;
+      const hp = parseFloat(String(searchMeta.hp)) || 0;
+      const mhp = parseFloat(String(searchMeta.mhp)) || 0;
       let bias: any = 'NEUTRAL';
       if (hp === mhp && hp !== 0) bias = 'SQUEEZE';
       else if (hp > mhp) bias = 'BULLISH';
@@ -191,24 +193,22 @@ const App: React.FC = () => {
 
       setMarketData({
         symbol,
-        currentPrice: currentPrice || parseFloat(searchMeta.currentPrice) || (historyPoints.length > 0 ? historyPoints[historyPoints.length - 1].price : 0),
-        change24h: parseFloat(searchMeta.change24h) || 0,
+        currentPrice: currentPrice || parseFloat(String(searchMeta.currentPrice)) || (historyPoints.length > 0 ? historyPoints[historyPoints.length - 1].price : 0),
+        change24h: parseFloat(String(searchMeta.change24h)) || 0,
         volume24h: 0,
-        vix: parseFloat(searchMeta.vix) || 15,
+        vix: parseFloat(String(searchMeta.vix)) || 15,
         history: historyPoints,
         levels: { 
           hp, mhp, 
-          hg: (parseFloat(searchMeta.yesterdayClose) + parseFloat(searchMeta.todayOpen)) / 2 || 0, 
-          gammaFlip: parseFloat(searchMeta.gammaFlip) || 0, 
-          maxGamma: parseFloat(searchMeta.maxGamma) || 0, 
-          vannaPivot: parseFloat(searchMeta.vannaPivot) || 0, 
+          hg: (parseFloat(String(searchMeta.yesterdayClose)) + parseFloat(String(searchMeta.todayOpen))) / 2 || 0, 
+          gammaFlip: parseFloat(String(searchMeta.gammaFlip)) || 0, 
+          maxGamma: parseFloat(String(searchMeta.maxGamma)) || 0, 
+          vannaPivot: parseFloat(String(searchMeta.vannaPivot)) || 0, 
           bias 
         }
       });
-      setLastRefresh(formatToEST(new Date()));
       setCountdown(isTradierConnected ? 30 : 60);
     } catch (e: any) {
-      setApiError('FETCH');
       addAlert('SYSTEM', `Connectivity Error: Institutional pipe failure.`);
     } finally { 
       setFetchingData(false);
@@ -227,7 +227,6 @@ const App: React.FC = () => {
   const runAnalysis = useCallback(async () => {
     if (!marketData || windowHistory.length === 0 || loading) return;
     setLoading(true);
-    setApiError(null);
     try {
       const result = await analyzeMarket(marketData, windowHistory);
       setAnalysis(result);
@@ -242,7 +241,7 @@ const App: React.FC = () => {
         liquidityZone: sig.isGoldenSetup ? 'GOLDEN SETUP' : sig.liquidityZone || 'NEUTRAL'
       }, ...prev].slice(0, 50));
     } catch (e) { 
-      setApiError('ANALYSIS'); 
+      addAlert('SYSTEM', 'Analysis Engine Failure');
     } finally { setLoading(false); }
   }, [marketData, windowHistory, loading, addAlert]);
 
@@ -256,10 +255,20 @@ const App: React.FC = () => {
       setInputToken(savedToken);
     }
     
-    (window as any).aistudio.hasSelectedApiKey().then((has: boolean) => {
-      setHasGeminiKey(has);
-      if (has) fetchData();
-    });
+    const aistudio = (window as any).aistudio;
+    if (aistudio && typeof aistudio.hasSelectedApiKey === 'function') {
+      aistudio.hasSelectedApiKey().then((has: boolean) => {
+        setHasGeminiKey(has);
+        if (has) fetchData();
+      }).catch(() => {
+        setHasGeminiKey(true);
+        fetchData();
+      });
+    } else {
+      // Fallback for environments where key dialog isn't needed/available
+      setHasGeminiKey(true);
+      fetchData();
+    }
   }, []);
 
   useEffect(() => {
@@ -306,7 +315,6 @@ const App: React.FC = () => {
 
   return (
     <div className="min-h-screen p-2 md:p-8 max-w-7xl mx-auto space-y-4 md:space-y-6 bg-[#020617] text-[#f8fafc] overflow-x-hidden relative selection:bg-sky-500/30">
-      {/* Responsive Alerts */}
       <div className="fixed top-4 md:top-24 right-4 md:right-8 z-[2000] flex flex-col gap-3 max-w-[calc(100%-2rem)] md:max-w-sm w-full pointer-events-none">
         {alerts.map(alert => (
           <div key={alert.id} className={`p-4 md:p-5 rounded-2xl border backdrop-blur-3xl shadow-2xl transition-all duration-500 pointer-events-auto ${alert.type === 'GOLDEN' ? 'bg-amber-500/10 border-amber-500/50 text-amber-500' : alert.type === 'SIGNAL' ? 'bg-emerald-500/10 border-emerald-500/50 text-emerald-400' : 'bg-slate-900 border-slate-700 text-slate-300'}`}>
@@ -353,7 +361,6 @@ const App: React.FC = () => {
       </nav>
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 md:gap-8 relative z-10">
-        {/* Main Section - Reordered for Mobile: Chart -> Signal -> Flow */}
         <div className="order-1 lg:order-2 lg:col-span-6 space-y-4 md:order-1 md:space-y-8">
           <div className={`glass-effect rounded-2xl md:rounded-[2.5rem] p-4 md:p-10 transition-all duration-700 ${isGoldenFlow ? 'border-amber-500/50 shadow-2xl' : 'border-sky-500/10 shadow-xl'} min-h-[400px] md:min-h-[550px] relative overflow-hidden`}>
             {fetchingData && !marketData ? (
@@ -385,7 +392,6 @@ const App: React.FC = () => {
                     flowHistory={windowHistory} 
                   />
                 </div>
-                {/* Responsive Level Grid */}
                 <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 md:gap-6 pt-4 md:pt-8 border-t border-slate-800/50">
                   {[
                     {k: 'WEEKLY HP', v: marketData.levels?.hp}, 
@@ -410,7 +416,6 @@ const App: React.FC = () => {
           </div>
           
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 md:gap-8">
-            {/* Sentiment Cards Scaled for Mobile */}
             <div className="glass-effect p-4 md:p-8 rounded-2xl md:rounded-[2rem] border border-slate-800/40">
               <h3 className="text-[8px] md:text-[10px] font-black text-slate-500 uppercase tracking-widest mb-4 md:mb-6">Ensemble Insights</h3>
               {analysis?.signal.ensembleInsights ? (
@@ -459,7 +464,6 @@ const App: React.FC = () => {
           </div>
         </div>
 
-        {/* Neural Vote - Order 2 on Mobile */}
         <div className="order-2 lg:order-3 lg:col-span-3 h-full">
           <div className={`glass-effect rounded-2xl md:rounded-[2.5rem] p-6 md:p-9 border-l-4 md:border-l-[6px] transition-all duration-1000 h-full flex flex-col shadow-xl relative ${oracleReady ? (analysis?.signal.type === 'BUY' ? 'border-emerald-500' : analysis?.signal.type === 'SELL' ? 'border-rose-500' : 'border-sky-500') : 'border-slate-800'}`}>
             <div className="flex justify-between items-start mb-8 md:mb-12">
@@ -497,7 +501,6 @@ const App: React.FC = () => {
           </div>
         </div>
 
-        {/* Lixi Sidebar - Order 3 on Mobile */}
         <div className="order-3 lg:order-1 lg:col-span-3">
           <div className="glass-effect rounded-2xl md:rounded-[2.5rem] p-4 md:p-7 border border-slate-800/40 h-[400px] md:h-[700px] flex flex-col shadow-xl relative overflow-hidden">
             <div className="flex justify-between items-center mb-6">
