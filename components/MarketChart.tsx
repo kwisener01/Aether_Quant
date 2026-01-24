@@ -36,21 +36,21 @@ const CustomTooltip = ({ active, payload, label }: any) => {
     };
 
     return (
-      <div className="bg-slate-950/95 border border-slate-800 p-4 rounded-2xl shadow-2xl backdrop-blur-3xl ring-1 ring-white/5 min-w-[180px]">
-        <p className="text-slate-500 text-[10px] font-mono mb-3 uppercase tracking-[0.2em] border-b border-slate-800 pb-2">{label} EST</p>
-        <div className="space-y-3">
+      <div className="bg-slate-950/98 border border-slate-800 p-3 md:p-4 rounded-xl md:rounded-2xl shadow-2xl backdrop-blur-3xl ring-1 ring-white/5 min-w-[150px] md:min-w-[180px]">
+        <p className="text-slate-500 text-[8px] md:text-[10px] font-mono mb-2 md:mb-3 uppercase tracking-[0.15em] border-b border-slate-800 pb-2">{label} EST</p>
+        <div className="space-y-2 md:space-y-3">
           <div className="flex justify-between items-center">
-            <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Price</span>
-            <span className="text-sky-400 font-black font-mono text-sm">${price?.toFixed(2)}</span>
+            <span className="text-[8px] md:text-[10px] font-black text-slate-500 uppercase tracking-widest">Price</span>
+            <span className="text-sky-400 font-black font-mono text-xs md:text-sm">${price?.toFixed(2)}</span>
           </div>
           {lixi !== undefined && (
             <div className="space-y-1">
               <div className="flex justify-between items-center">
-                <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Lixi Depth</span>
-                <span className={`font-black font-mono text-sm ${getLabelColor(flowLabel)}`}>{lixi.toFixed(2)}</span>
+                <span className="text-[8px] md:text-[10px] font-black text-slate-500 uppercase tracking-widest">Lixi Depth</span>
+                <span className={`font-black font-mono text-xs md:text-sm ${getLabelColor(flowLabel)}`}>{lixi.toFixed(2)}</span>
               </div>
-              <div className={`text-[9px] font-black uppercase tracking-[0.15em] text-right ${getLabelColor(flowLabel)}`}>
-                {flowLabel === TickLabel.UPWARDS ? 'BULLISH FLOW' : flowLabel === TickLabel.DOWNWARDS ? 'BEARISH FLOW' : 'NEUTRAL ABSORPTION'}
+              <div className={`text-[7px] md:text-[9px] font-black uppercase tracking-[0.1em] text-right ${getLabelColor(flowLabel)}`}>
+                {flowLabel === TickLabel.UPWARDS ? 'BULLISH' : flowLabel === TickLabel.DOWNWARDS ? 'BEARISH' : 'ABSORPTION'}
               </div>
             </div>
           )}
@@ -67,9 +67,9 @@ const SignalMarker = (props: any) => {
   const color = isBuy ? '#10b981' : '#f43f5e';
   return (
     <g transform={`translate(${cx},${cy})`} onMouseEnter={(e) => onMouseEnter(e, payload, cx, cy)} onMouseLeave={onMouseLeave}>
-      <circle r="14" fill="transparent" className="cursor-crosshair pointer-events-all" />
-      <circle r="6" fill={color} fillOpacity="0.2" stroke={color} strokeWidth="2" className="animate-pulse" />
-      <path d={isBuy ? "M0 -4 L4 3 L-4 3 Z" : "M0 4 L4 -3 L-4 -3 Z"} fill={color} />
+      <circle r="12" fill="transparent" className="cursor-pointer" />
+      <circle r="5" fill={color} fillOpacity="0.3" stroke={color} strokeWidth="1.5" className="animate-pulse" />
+      <path d={isBuy ? "M0 -3 L3 2 L-3 2 Z" : "M0 3 L3 -2 L-3 -2 Z"} fill={color} />
     </g>
   );
 };
@@ -78,7 +78,6 @@ const MarketChart: React.FC<MarketChartProps> = ({ data, symbol, signals, levels
   const [hoveredItem, setHoveredItem] = useState<any | null>(null);
   const [tooltipPos, setTooltipPos] = useState({ x: 0, y: 0 });
 
-  // Segment Lixi data by sentiment for multi-color area rendering
   const mergedData = useMemo(() => {
     return data.map((d, i) => {
       const flowIndex = Math.floor((i / data.length) * flowHistory.length);
@@ -90,7 +89,6 @@ const MarketChart: React.FC<MarketChartProps> = ({ data, symbol, signals, levels
         ...d,
         lixi: lixiValue,
         flowLabel: label,
-        // Segmented keys for Area rendering
         lixiBull: label === TickLabel.UPWARDS ? lixiValue : null,
         lixiBear: label === TickLabel.DOWNWARDS ? lixiValue : null,
         lixiNeut: label === TickLabel.STATIONARY ? lixiValue : null,
@@ -124,21 +122,20 @@ const MarketChart: React.FC<MarketChartProps> = ({ data, symbol, signals, levels
   };
 
   return (
-    <div className="w-full h-full flex flex-col relative group">
-      {/* Price Pane (Top 70%) */}
+    <div className="w-full h-full flex flex-col relative">
       <div className="h-[70%] w-full relative">
-        <div className="absolute top-2 left-2 z-20 flex gap-2 pointer-events-none">
-           <span className="px-3 py-1 bg-sky-500/10 border border-sky-500/20 text-sky-400 text-[9px] font-black uppercase tracking-widest rounded-lg backdrop-blur-md shadow-xl">Institutional Tape</span>
+        <div className="absolute top-1 md:top-2 left-1 md:left-2 z-20 pointer-events-none">
+           <span className="px-2 py-0.5 bg-sky-500/10 border border-sky-500/20 text-sky-400 text-[7px] md:text-[9px] font-black uppercase tracking-widest rounded-md backdrop-blur-md">Institutional Tape</span>
         </div>
         <ResponsiveContainer width="100%" height="100%">
-          <AreaChart data={mergedData} syncId="aetherSync" margin={{ top: 15, right: 0, bottom: 0, left: 0 }}>
+          <AreaChart data={mergedData} syncId="aetherSync" margin={{ top: 10, right: 0, bottom: 0, left: 0 }}>
             <defs>
               <linearGradient id="colorPrice" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="5%" stopColor="#0ea5e9" stopOpacity={0.2}/>
+                <stop offset="5%" stopColor="#0ea5e9" stopOpacity={0.15}/>
                 <stop offset="95%" stopColor="#0ea5e9" stopOpacity={0}/>
               </linearGradient>
             </defs>
-            <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} strokeOpacity={0.15} />
+            <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} strokeOpacity={0.1} />
             <XAxis dataKey="time" hide />
             <YAxis hide domain={yPriceDomain} />
             <Tooltip content={<CustomTooltip />} />
@@ -147,30 +144,18 @@ const MarketChart: React.FC<MarketChartProps> = ({ data, symbol, signals, levels
               type="monotone" 
               dataKey="price" 
               stroke="#0ea5e9" 
-              strokeWidth={2.5} 
+              strokeWidth={2} 
               fillOpacity={1} 
               fill="url(#colorPrice)" 
-              isAnimationActive={true} 
+              isAnimationActive={false} 
             />
 
-            {/* Levels */}
             {levels?.gammaFlip && (
-              <ReferenceLine y={levels.gammaFlip} stroke="#22d3ee" strokeDasharray="4 4" strokeOpacity={0.4} strokeWidth={1}>
-                <Label value="GF" position="insideRight" fill="#22d3ee" fontSize={9} fontWeight="900" />
-              </ReferenceLine>
-            )}
-            {levels?.mhp && (
-              <ReferenceLine y={levels.mhp} stroke="#f43f5e" strokeOpacity={0.4} strokeWidth={1.5}>
-                <Label value="MHP" position="insideLeft" fill="#f43f5e" fontSize={9} fontWeight="900" offset={10} />
-              </ReferenceLine>
-            )}
-            {levels?.hp && (
-              <ReferenceLine y={levels.hp} stroke="#f59e0b" strokeOpacity={0.4} strokeWidth={1.5} strokeDasharray="6 2">
-                <Label value="HP" position="insideLeft" fill="#f59e0b" fontSize={9} fontWeight="900" offset={10} />
+              <ReferenceLine y={levels.gammaFlip} stroke="#22d3ee" strokeDasharray="4 4" strokeOpacity={0.3} strokeWidth={1}>
+                <Label value="GF" position="insideRight" fill="#22d3ee" fontSize={7} fontWeight="900" />
               </ReferenceLine>
             )}
 
-            {/* Signals */}
             {visibleSignals.map((signal) => (
               <ReferenceDot 
                 key={signal.id} 
@@ -184,106 +169,58 @@ const MarketChart: React.FC<MarketChartProps> = ({ data, symbol, signals, levels
         </ResponsiveContainer>
       </div>
 
-      {/* Lixi Pane (Bottom 30%) - INDICATOR MODE */}
-      <div className="h-[30%] w-full relative mt-4 border-t border-slate-800/60 bg-slate-900/10">
-        <div className="absolute top-2 left-2 z-20 flex gap-2 pointer-events-none">
-           <span className="px-3 py-1 bg-slate-900/50 border border-slate-800/80 text-slate-400 text-[9px] font-black uppercase tracking-widest rounded-lg">Aether Lixi Sentiment</span>
-        </div>
-        <div className="absolute bottom-2 right-4 z-20 flex gap-4 pointer-events-none">
-           <div className="flex items-center gap-1.5"><div className="w-1.5 h-1.5 rounded-full bg-emerald-500" /><span className="text-[7px] font-black text-slate-500 uppercase tracking-widest">Bullish</span></div>
-           <div className="flex items-center gap-1.5"><div className="w-1.5 h-1.5 rounded-full bg-rose-500" /><span className="text-[7px] font-black text-slate-500 uppercase tracking-widest">Bearish</span></div>
-           <div className="flex items-center gap-1.5"><div className="w-1.5 h-1.5 rounded-full bg-amber-500" /><span className="text-[7px] font-black text-slate-500 uppercase tracking-widest">Neutral</span></div>
+      <div className="h-[30%] w-full relative mt-2 md:mt-4 border-t border-slate-800/60 bg-slate-900/5">
+        <div className="absolute top-1 md:top-2 left-1 md:left-2 z-20 pointer-events-none">
+           <span className="px-2 py-0.5 bg-slate-900/50 border border-slate-800/80 text-slate-400 text-[7px] md:text-[9px] font-black uppercase tracking-widest rounded-md">Lixi Sentiment</span>
         </div>
         
         <ResponsiveContainer width="100%" height="100%">
-          <AreaChart data={mergedData} syncId="aetherSync" margin={{ top: 10, right: 0, bottom: 25, left: 0 }}>
+          <AreaChart data={mergedData} syncId="aetherSync" margin={{ top: 5, right: 0, bottom: 15, left: 0 }}>
             <defs>
               <linearGradient id="lixiBullGrad" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="5%" stopColor="#10b981" stopOpacity={0.4}/>
+                <stop offset="5%" stopColor="#10b981" stopOpacity={0.3}/>
                 <stop offset="95%" stopColor="#10b981" stopOpacity={0}/>
               </linearGradient>
               <linearGradient id="lixiBearGrad" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="5%" stopColor="#f43f5e" stopOpacity={0.4}/>
+                <stop offset="5%" stopColor="#f43f5e" stopOpacity={0.3}/>
                 <stop offset="95%" stopColor="#f43f5e" stopOpacity={0}/>
               </linearGradient>
-              <linearGradient id="lixiNeutGrad" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="5%" stopColor="#f59e0b" stopOpacity={0.2}/>
-                <stop offset="95%" stopColor="#f59e0b" stopOpacity={0}/>
-              </linearGradient>
             </defs>
-            <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} strokeOpacity={0.1} />
+            <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} strokeOpacity={0.05} />
             <XAxis 
               dataKey="time" 
               stroke="#475569" 
-              fontSize={8} 
+              fontSize={7} 
               tickLine={false} 
               axisLine={false} 
-              minTickGap={60} 
+              minTickGap={40} 
               fontFamily="JetBrains Mono" 
-              dy={10}
             />
             <YAxis hide domain={[0, 15]} />
             <Tooltip content={<CustomTooltip />} />
             
-            {/* Sentiment Segments */}
-            <Area 
-              type="monotone" 
-              dataKey="lixiBull" 
-              stroke="#10b981" 
-              strokeWidth={2} 
-              fillOpacity={1} 
-              fill="url(#lixiBullGrad)" 
-              connectNulls={false}
-              isAnimationActive={false}
-            />
-            <Area 
-              type="monotone" 
-              dataKey="lixiBear" 
-              stroke="#f43f5e" 
-              strokeWidth={2} 
-              fillOpacity={1} 
-              fill="url(#lixiBearGrad)" 
-              connectNulls={false}
-              isAnimationActive={false}
-            />
-            <Area 
-              type="monotone" 
-              dataKey="lixiNeut" 
-              stroke="#f59e0b" 
-              strokeWidth={1.5} 
-              fillOpacity={1} 
-              fill="url(#lixiNeutGrad)" 
-              connectNulls={false}
-              isAnimationActive={false}
-            />
+            <Area type="monotone" dataKey="lixiBull" stroke="#10b981" strokeWidth={1.5} fillOpacity={1} fill="url(#lixiBullGrad)" connectNulls={false} isAnimationActive={false} />
+            <Area type="monotone" dataKey="lixiBear" stroke="#f43f5e" strokeWidth={1.5} fillOpacity={1} fill="url(#lixiBearGrad)" connectNulls={false} isAnimationActive={false} />
+            <Area type="monotone" dataKey="lixiNeut" stroke="#f59e0b" strokeWidth={1} fillOpacity={0.1} fill="#f59e0b" connectNulls={false} isAnimationActive={false} />
 
-            {/* Baseline at 5.0 (Neutral Lixi) */}
             <ReferenceLine y={5} stroke="#1e293b" strokeWidth={1} />
           </AreaChart>
         </ResponsiveContainer>
       </div>
 
-      {/* Signal Detail Modal Overlay */}
       {hoveredItem && (
         <div 
-          className="absolute z-[100] bg-slate-950/98 backdrop-blur-3xl border border-slate-800 p-5 rounded-[2rem] shadow-2xl pointer-events-none -translate-x-1/2 -translate-y-[120%] animate-in fade-in zoom-in duration-300 min-w-[200px] ring-1 ring-white/10" 
+          className="absolute z-[100] bg-slate-950/98 backdrop-blur-3xl border border-slate-800 p-4 md:p-5 rounded-2xl md:rounded-[2rem] shadow-2xl pointer-events-none -translate-x-1/2 -translate-y-[120%] animate-in fade-in zoom-in duration-300 min-w-[160px] md:min-w-[200px] ring-1 ring-white/10" 
           style={{ left: tooltipPos.x, top: tooltipPos.y }}
         >
-          <div className="flex justify-between items-start mb-4">
-            <span className="text-[10px] font-black text-slate-500 uppercase tracking-[0.2em]">{hoveredItem.liquidityZone}</span>
-            {hoveredItem.isGoldenSetup && (
-              <span className="px-2 py-0.5 bg-amber-500/20 text-amber-500 border border-amber-500/40 rounded text-[8px] font-black uppercase">Golden</span>
-            )}
+          <div className="flex justify-between items-start mb-2 md:mb-4">
+            <span className="text-[7px] md:text-[10px] font-black text-slate-500 uppercase tracking-[0.2em]">{hoveredItem.liquidityZone}</span>
           </div>
-          <div className={`text-xl font-black italic tracking-tighter mb-4 ${hoveredItem.type === 'BUY' ? 'text-emerald-400' : 'text-rose-400'}`}>{hoveredItem.type} SETUP</div>
-          <div className="space-y-2 pt-4 border-t border-slate-900">
+          <div className={`text-sm md:text-xl font-black italic tracking-tighter mb-2 md:mb-4 ${hoveredItem.type === 'BUY' ? 'text-emerald-400' : 'text-rose-400'}`}>{hoveredItem.type} SETUP</div>
+          <div className="space-y-1 md:space-y-2 pt-2 md:pt-4 border-t border-slate-900">
             <div className="flex justify-between items-center">
-              <span className="text-[10px] font-bold text-slate-600 uppercase">Confidence</span>
-              <span className="text-[11px] font-black text-sky-400 tabular-nums">{hoveredItem.voteCount}%</span>
-            </div>
-            <div className="flex justify-between items-center">
-              <span className="text-[10px] font-bold text-slate-600 uppercase">Risk Level</span>
-              <span className="text-[11px] font-black text-emerald-400">{hoveredItem.executionStatus}</span>
+              <span className="text-[8px] md:text-[10px] font-bold text-slate-600 uppercase">Confidence</span>
+              <span className="text-[9px] md:text-[11px] font-black text-sky-400 tabular-nums">{hoveredItem.voteCount}%</span>
             </div>
           </div>
         </div>
