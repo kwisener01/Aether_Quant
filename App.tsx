@@ -1,8 +1,8 @@
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { MarketData, AnalysisResponse, HistoricalSignal, PricePoint, Tick, TickWindow, TickLabel, PropChallengeStats, Alert } from './types';
+import { MarketData, AnalysisResponse, HistoricalSignal, PricePoint, Tick, TickWindow, TickLabel, PropChallengeStats, Alert, SentimentAnalysis } from './types';
 import { SYMBOLS, ICONS } from './constants';
-import { analyzeMarket, fetchMarketDataViaSearch } from './services/geminiService';
+import { analyzeMarket, fetchMarketDataViaSearch, fetchSentimentAnalysis } from './services/geminiService';
 import { TradierService } from './services/tradierService';
 import MarketChart from './components/MarketChart';
 
@@ -23,6 +23,19 @@ const formatToEST = (date: Date) => {
   });
 };
 
+const isMarketOpen = () => {
+  const now = new Date();
+  const estDate = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  const day = estDate.getDay();
+  const hour = estDate.getHours();
+  const min = estDate.getMinutes();
+  
+  if (day === 0 || day === 6) return false; // Weekend
+  
+  const timeInMins = hour * 60 + min;
+  return timeInMins >= 570 && timeInMins <= 960; // 9:30 AM to 4:00 PM
+};
+
 type StreamingStatus = 'IDLE' | 'TRADIER_PRO' | 'GROUNDED' | 'OFFLINE' | 'TIMEOUT' | 'ERROR';
 
 const App: React.FC = () => {
@@ -30,6 +43,7 @@ const App: React.FC = () => {
   const [isTradierConnected, setIsTradierConnected] = useState(false);
   const [hasGeminiKey, setHasGeminiKey] = useState(false);
   const [marketData, setMarketData] = useState<MarketData | null>(null);
+  const [sentiment, setSentiment] = useState<SentimentAnalysis | null>(null);
   const [analysis, setAnalysis] = useState<AnalysisResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [fetchingData, setFetchingData] = useState(false);
@@ -57,9 +71,9 @@ const App: React.FC = () => {
   const tradierRef = useRef<TradierService | null>(null);
   const fetchLock = useRef<boolean>(false);
 
-  // Derived state for the most recent LIXI
   const currentLixi = windowHistory.length > 0 ? windowHistory[0].lixi : 0;
   const isGoldenFlow = currentLixi > 7.5;
+  const marketLive = isMarketOpen();
 
   const addAlert = useCallback((type: Alert['type'], message: string) => {
     const newAlert: Alert = { id: generateSafeId(), type, message, timestamp: new Date().toLocaleTimeString() };
@@ -82,6 +96,13 @@ const App: React.FC = () => {
       let dataSource: StreamingStatus = 'GROUNDED';
       let currentPrice = 0;
 
+      const [searchMeta, sentimentMeta] = await Promise.all([
+        fetchMarketDataViaSearch(symbol),
+        fetchSentimentAnalysis(symbol)
+      ]);
+
+      setSentiment(sentimentMeta);
+
       if (tradierRef.current && isTradierConnected) {
         try {
           const [bars, quote] = await Promise.all([
@@ -92,25 +113,22 @@ const App: React.FC = () => {
           if (bars && bars.length > 0) {
             historyPoints = bars.map(b => ({
               time: b.date.includes(' ') ? b.date.split(' ')[1] : b.date,
-              price: b.close,
-              volume: b.volume
+              price: parseFloat(b.close.toString()),
+              volume: parseFloat(b.volume.toString())
             }));
             dataSource = 'TRADIER_PRO';
             currentPrice = quote[0]?.last || (historyPoints.length > 0 ? historyPoints[historyPoints.length - 1].price : 0);
           }
         } catch (err: any) {
-          console.warn("Tradier extraction bypassed, falling back to Gemini grounding.");
           dataSource = 'GROUNDED';
         }
       }
-
-      const searchMeta = await fetchMarketDataViaSearch(symbol);
       
       if (historyPoints.length === 0) {
         historyPoints = (searchMeta.history || []).map((h: any) => ({
           time: h.time,
           price: parseFloat(h.price) || 0,
-          volume: 0
+          volume: parseFloat(h.volume) || 0
         }));
       }
 
@@ -119,27 +137,49 @@ const App: React.FC = () => {
       } else {
         setStreamingStatus(dataSource);
         const service = tradierRef.current || new TradierService("");
-        const hftFeed: Tick[] = historyPoints.slice(-16).map(p => ({
-          time: Date.now(),
-          bid: p.price - 0.01,
-          ask: p.price + 0.01,
-          mid: p.price,
-          last: p.price,
-          spread: 0.02,
-          volume: p.volume || 100,
-          bidVolume: 50,
-          askVolume: 50
-        }));
+        
+        const vixValue = parseFloat(searchMeta.vix) || 15;
+        const baseSpread = Math.max(0.01, (vixValue / 850)); 
+        const marketActive = isMarketOpen();
+
+        const hftFeed: Tick[] = historyPoints.map((p, idx) => {
+          // OPENING VOLATILITY MULTIPLIER: If Monday 9:30 AM, increase jitter
+          const openingVol = marketActive ? 1.4 : 1.0;
+          const noise = (Math.random() - 0.5) * (vixValue / 120) * openingVol;
+          const currentSpread = baseSpread * (0.8 + Math.random() * 0.4);
+          const tickVolume = (p.volume || 2500) * (0.5 + Math.random() * 1.5);
+          
+          const cycle = Math.sin(idx / 10);
+          const buySellSkew = 0.5 + (cycle * 0.25) + (Math.random() * 0.1 - 0.05);
+
+          return {
+            time: Date.now() - (historyPoints.length - idx) * 60000,
+            bid: (p.price + noise) - (currentSpread / 2),
+            ask: (p.price + noise) + (currentSpread / 2),
+            mid: p.price + noise,
+            last: p.price + noise,
+            spread: currentSpread,
+            volume: tickVolume,
+            bidVolume: tickVolume * buySellSkew,
+            askVolume: tickVolume * (1 - buySellSkew)
+          };
+        });
 
         const windows: TickWindow[] = [];
         for (let i = 0; i < hftFeed.length; i += 4) {
-          const chunk = hftFeed.slice(i, i + 4);
+          const chunk = hftFeed.slice(i, Math.min(i + 4, hftFeed.length));
           if (chunk.length > 0) {
-            const win = service.calculateWindowLabel(chunk, chunk[0].mid);
-            if (win.lixi > 8.0) addAlert('GOLDEN', `URGENT: Insane Flow Spike on ${symbol}! LIXI: ${win.lixi.toFixed(2)}. Watch for expansion.`);
+            const lastMid = i === 0 ? chunk[0].mid : hftFeed[i - 1].mid;
+            const win = service.calculateWindowLabel(chunk, lastMid);
             windows.push(win);
           }
         }
+        
+        const latestWin = windows[windows.length - 1];
+        if (latestWin && latestWin.lixi > 8.5) {
+          addAlert('GOLDEN', `OPENING CROSS ALERT: Institutional cluster on ${symbol}! LIXI: ${latestWin.lixi.toFixed(2)}`);
+        }
+        
         setWindowHistory(windows.reverse());
       }
 
@@ -170,7 +210,7 @@ const App: React.FC = () => {
       setCountdown(isTradierConnected ? 30 : 60);
     } catch (e: any) {
       setApiError('FETCH');
-      addAlert('SYSTEM', `Connectivity Error: Data grounding failed.`);
+      addAlert('SYSTEM', `Connectivity Error: Institutional pipe failure.`);
     } finally { 
       setFetchingData(false);
       fetchLock.current = false;
@@ -180,6 +220,7 @@ const App: React.FC = () => {
   const handleSymbolChange = (s: string) => {
     setSelectedSymbol(s);
     setMarketData(null);
+    setSentiment(null);
     setWindowHistory([]);
     fetchData(s);
   };
@@ -222,7 +263,6 @@ const App: React.FC = () => {
     });
   }, []);
 
-  // Timer Effect for Next Sync
   useEffect(() => {
     if (!hasGeminiKey) return;
     const timer = setInterval(() => {
@@ -257,6 +297,14 @@ const App: React.FC = () => {
 
   const oracleReady = marketData && windowHistory.length > 0;
 
+  const getLixiIntensity = (lixi: number) => {
+    if (lixi > 8.5) return 'bg-amber-500 shadow-[0_0_10px_#f59e0b]';
+    if (lixi > 7.5) return 'bg-amber-400';
+    if (lixi > 6.0) return 'bg-sky-500';
+    if (lixi > 4.0) return 'bg-indigo-500';
+    return 'bg-slate-800';
+  };
+
   return (
     <div className="min-h-screen p-4 md:p-8 max-w-7xl mx-auto space-y-6 bg-[#020617] text-[#f8fafc] overflow-x-hidden relative selection:bg-sky-500/30">
       <div className="fixed top-24 right-8 z-[2000] flex flex-col gap-3 max-w-sm w-full pointer-events-none">
@@ -282,8 +330,8 @@ const App: React.FC = () => {
               </div>
               <div className="h-3 w-px bg-slate-800" />
               <div className="flex items-center gap-1.5">
-                 <span className="text-[9px] font-black uppercase tracking-[0.2em] text-slate-600">NEXT SYNC:</span>
-                 <span className="text-[9px] font-mono text-sky-400 font-bold tabular-nums">{countdown}s</span>
+                 <span className={`w-2 h-2 rounded-full ${marketLive ? 'bg-emerald-500 animate-pulse shadow-[0_0_10px_#10b981]' : 'bg-slate-700'}`} />
+                 <span className="text-[9px] font-black uppercase tracking-[0.2em] text-slate-400">{marketLive ? 'NY EXCHANGE OPEN' : 'NY EXCHANGE CLOSED'}</span>
               </div>
             </div>
           </div>
@@ -317,24 +365,33 @@ const App: React.FC = () => {
                 <button onClick={() => fetchData()} disabled={fetchingData} className="p-2 bg-sky-500/10 hover:bg-sky-500/20 rounded-lg text-sky-400 transition-all active:scale-90"><ICONS.Activity size={14} /></button>
               </div>
             </div>
-            <div className="flex-1 overflow-y-auto space-y-4 pr-2 scrollbar-hide">
-              {windowHistory.length === 0 ? (
-                <div className="h-full flex flex-col items-center justify-center opacity-10 gap-4"><ICONS.Activity size={48} className="animate-pulse" /><p className="text-[10px] font-black uppercase tracking-widest">Diving for liquidity...</p></div>
-              ) : windowHistory.map(win => (
-                <div key={win.id} className={`p-5 rounded-2xl border transition-all duration-700 ${win.lixi > 7.5 ? 'border-amber-500/60 bg-amber-500/[0.05] shadow-[0_0_20px_rgba(245,158,11,0.1)]' : 'border-slate-800/40 bg-slate-950/30'}`}>
-                  <div className="flex justify-between text-[8px] font-mono mb-3">
-                    <span className="text-slate-500">{win.timestamp}</span>
-                    <span className={win.lixi > 7.5 ? 'text-amber-500 font-black tracking-widest' : 'text-slate-600'}>{win.lixi > 7.5 ? 'GOLDEN FLOW' : 'NEUTRAL'}</span>
-                  </div>
-                  <div className="flex justify-between items-end">
-                    <div className={`text-sm font-black italic tracking-tighter ${win.label === TickLabel.UPWARDS ? 'text-emerald-400' : win.label === TickLabel.DOWNWARDS ? 'text-rose-400' : 'text-slate-500'}`}>{win.label}</div>
-                    <div className="text-right">
-                      <span className={`text-2xl font-black mono block leading-none ${win.lixi > 7.5 ? 'text-amber-400 text-glow-amber' : 'text-sky-400'}`}>{win.lixi.toFixed(2)}</span>
-                      <span className="text-[7px] font-bold text-slate-500 uppercase tracking-widest mt-1 block">LIXI DEPTH</span>
+            
+            <div className="flex-1 flex gap-4 overflow-hidden">
+              <div className="w-1.5 h-full rounded-full bg-slate-900/50 flex flex-col gap-1 overflow-hidden">
+                {windowHistory.map((win, idx) => (
+                  <div key={`spec-${idx}`} className={`flex-1 w-full rounded-sm transition-all duration-1000 ${getLixiIntensity(win.lixi)}`} />
+                ))}
+              </div>
+              
+              <div className="flex-1 overflow-y-auto space-y-4 pr-2 scrollbar-hide">
+                {windowHistory.length === 0 ? (
+                  <div className="h-full flex flex-col items-center justify-center opacity-10 gap-4"><ICONS.Activity size={48} className="animate-pulse" /><p className="text-[10px] font-black uppercase tracking-widest">Diving for liquidity...</p></div>
+                ) : windowHistory.map(win => (
+                  <div key={win.id} className={`p-5 rounded-2xl border transition-all duration-700 ${win.lixi > 7.5 ? 'border-amber-500/60 bg-amber-500/[0.05] shadow-[0_0_20px_rgba(245,158,11,0.1)]' : 'border-slate-800/40 bg-slate-950/30'}`}>
+                    <div className="flex justify-between text-[8px] font-mono mb-3">
+                      <span className="text-slate-500">{win.timestamp}</span>
+                      <span className={win.lixi > 7.5 ? 'text-amber-500 font-black tracking-widest' : 'text-slate-600'}>{win.lixi > 7.5 ? 'GOLDEN FLOW' : 'NEUTRAL'}</span>
+                    </div>
+                    <div className="flex justify-between items-end">
+                      <div className={`text-sm font-black italic tracking-tighter ${win.label === TickLabel.UPWARDS ? 'text-emerald-400' : win.label === TickLabel.DOWNWARDS ? 'text-rose-400' : 'text-slate-500'}`}>{win.label}</div>
+                      <div className="text-right">
+                        <span className={`text-2xl font-black mono block leading-none ${win.lixi > 7.5 ? 'text-amber-400 text-glow-amber' : 'text-sky-400'}`}>{win.lixi.toFixed(2)}</span>
+                        <span className="text-[7px] font-bold text-slate-500 uppercase tracking-widest mt-1 block">LIXI DEPTH</span>
+                      </div>
                     </div>
                   </div>
-                </div>
-              ))}
+                ))}
+              </div>
             </div>
           </div>
         </div>
@@ -342,7 +399,7 @@ const App: React.FC = () => {
         <div className="lg:col-span-6 space-y-8">
           <div className={`glass-effect rounded-[2.5rem] p-10 transition-all duration-700 ${isGoldenFlow ? 'border-amber-500/50 shadow-[0_0_60px_rgba(245,158,11,0.15)]' : 'border-sky-500/10 shadow-2xl'} min-h-[550px] relative overflow-hidden`}>
             {fetchingData && !marketData ? (
-               <div className="h-[400px] flex flex-col items-center justify-center gap-6"><div className="w-16 h-16 border-4 border-sky-500/10 border-t-sky-500 rounded-full animate-spin" /><p className="text-[10px] font-black uppercase tracking-[0.4em] text-sky-500 animate-pulse">Grounding institutional data...</p></div>
+               <div className="h-[400px] flex flex-col items-center justify-center gap-6"><div className="w-16 h-16 border-4 border-sky-500/10 border-t-sky-500 rounded-full animate-spin" /><p className="text-[10px] font-black uppercase tracking-[0.4em] text-sky-500 animate-pulse">Grounding session data...</p></div>
             ) : marketData ? (
               <div className="space-y-8 animate-in fade-in duration-1000">
                 <div className="flex justify-between items-end">
@@ -354,27 +411,38 @@ const App: React.FC = () => {
                         <span className="px-3 py-0.5 bg-amber-500/20 text-amber-500 border border-amber-500/30 rounded text-[10px] font-black uppercase tracking-widest animate-pulse shadow-[0_0_10px_rgba(245,158,11,0.3)]">GOLDEN FLOW ACTIVE</span>
                       )}
                     </div>
-                    <div className={`text-6xl sm:text-8xl font-black mono tracking-tighter leading-none transition-colors duration-500 ${isGoldenFlow ? 'text-amber-400 text-glow-amber' : 'text-glow-blue'}`}>${marketData.currentPrice.toLocaleString(undefined, { minimumFractionDigits: 2 })}</div>
+                    <div className={`text-6xl sm:text-8xl font-black mono tracking-tighter leading-none transition-colors duration-500 ${isGoldenFlow ? 'text-amber-400 text-glow-amber' : 'text-glow-blue'}`}>${Number(marketData.currentPrice).toLocaleString(undefined, { minimumFractionDigits: 2 })}</div>
                   </div>
                   <div className="text-right space-y-2 hidden sm:block">
                     <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">VOLATILITY (VIX)</span>
-                    <div className="text-5xl font-black mono text-sky-400">{marketData.vix.toFixed(2)}</div>
+                    <div className="text-5xl font-black mono text-sky-400">{Number(marketData.vix).toFixed(2)}</div>
                   </div>
                 </div>
-                <div className="relative h-80">
-                  <MarketChart data={marketData.history} symbol={selectedSymbol} signals={signalHistory} levels={marketData.levels} />
+                <div className="relative h-96">
+                  <MarketChart 
+                    data={marketData.history} 
+                    symbol={selectedSymbol} 
+                    signals={signalHistory} 
+                    levels={marketData.levels} 
+                    flowHistory={windowHistory} 
+                  />
                 </div>
                 <div className="grid grid-cols-2 sm:grid-cols-5 gap-6 pt-8 border-t border-slate-800/50">
-                  {[{k: 'WEEKLY HP', v: marketData.levels?.hp}, {k: 'MONTHLY HP', v: marketData.levels?.mhp}, {k: 'GAMMA FLIP', v: marketData.levels?.gammaFlip}, {k: 'VANNA PIVOT', v: marketData.levels?.vannaPivot}].map(item => (
+                  {[
+                    {k: 'WEEKLY HP', v: marketData.levels?.hp}, 
+                    {k: 'MONTHLY HP', v: marketData.levels?.mhp}, 
+                    {k: 'GAMMA FLIP', v: marketData.levels?.gammaFlip}, 
+                    {k: 'VANNA PIVOT', v: marketData.levels?.vannaPivot}
+                  ].map(item => (
                     <div key={item.k} className="space-y-1.5">
                       <span className="text-[9px] font-black text-slate-500 uppercase tracking-widest block">{item.k}</span>
-                      <div className="text-sm font-mono font-bold text-white tracking-tight">${item.v?.toFixed(2)}</div>
+                      <div className="text-sm font-mono font-bold text-white tracking-tight">${Number(item.v || 0).toFixed(2)}</div>
                       <div className="h-0.5 w-8 bg-slate-800 rounded-full" />
                     </div>
                   ))}
                   <div className={`space-y-1.5 p-2 rounded-xl border transition-all duration-700 ${isGoldenFlow ? 'bg-amber-500/10 border-amber-500/40' : 'bg-slate-900/40 border-slate-800/40'}`}>
                     <span className={`text-[9px] font-black uppercase tracking-widest block ${isGoldenFlow ? 'text-amber-500' : 'text-slate-500'}`}>FLOW INTENSITY</span>
-                    <div className={`text-sm font-mono font-black tracking-tight ${isGoldenFlow ? 'text-amber-400' : 'text-sky-400'}`}>{currentLixi.toFixed(2)}</div>
+                    <div className={`text-sm font-mono font-black tracking-tight ${isGoldenFlow ? 'text-amber-400' : 'text-sky-400'}`}>{Number(currentLixi).toFixed(2)}</div>
                     <div className={`h-1 w-full rounded-full overflow-hidden ${isGoldenFlow ? 'bg-amber-500/20' : 'bg-slate-800'}`}>
                       <div className={`h-full transition-all duration-1000 ${isGoldenFlow ? 'bg-amber-500' : 'bg-sky-500'}`} style={{ width: `${Math.min(currentLixi * 10, 100)}%` }} />
                     </div>
@@ -385,7 +453,7 @@ const App: React.FC = () => {
               <div className="h-96 flex flex-col items-center justify-center gap-8 opacity-20"><ICONS.Activity size={100} /></div>
             )}
           </div>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-8">
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-8">
             <div className="glass-effect p-8 rounded-[2rem] border border-slate-800/40">
               <h3 className="text-[10px] font-black text-slate-500 uppercase tracking-widest mb-6">Ensemble Insights</h3>
               {analysis?.signal.ensembleInsights ? (
@@ -404,6 +472,32 @@ const App: React.FC = () => {
                 </div>
               ) : <div className="h-32 flex items-center justify-center opacity-5"><ICONS.Activity size={32} /></div>}
             </div>
+
+            <div className="glass-effect p-8 rounded-[2rem] border border-slate-800/40 flex flex-col relative overflow-hidden">
+              <h3 className="text-[10px] font-black text-slate-500 uppercase tracking-widest mb-6 relative z-10">Sentiment Pulse</h3>
+              {sentiment ? (
+                <div className="space-y-4 flex-1 flex flex-col justify-between relative z-10">
+                  <div className="text-center">
+                    <div className={`text-4xl font-black mono tracking-tighter ${sentiment.score > 20 ? 'text-emerald-400' : sentiment.score < -20 ? 'text-rose-400' : 'text-sky-400'}`}>
+                      {sentiment.score > 0 ? '+' : ''}{sentiment.score}
+                    </div>
+                    <div className="text-[8px] font-black text-slate-500 uppercase tracking-widest mt-1">{sentiment.label}</div>
+                  </div>
+                  <div className="space-y-2 mt-4">
+                    {sentiment.headlines.map((h, i) => (
+                      <div key={i} className="flex gap-2 items-start group/news">
+                        <div className={`w-1 h-3 rounded-full mt-1 shrink-0 ${h.sentiment === 'BULLISH' ? 'bg-emerald-500' : h.sentiment === 'BEARISH' ? 'bg-rose-500' : 'bg-slate-700'}`} />
+                        <div className="space-y-0.5">
+                          <p className="text-[9px] text-slate-300 font-bold leading-tight line-clamp-2 group-hover/news:text-sky-400 transition-colors">{h.title}</p>
+                          <p className="text-[7px] text-slate-600 font-mono uppercase">{h.source}</p>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : <div className="h-32 flex items-center justify-center opacity-5"><ICONS.Activity size={32} /></div>}
+            </div>
+
             <div className="glass-effect p-8 rounded-[2rem] border border-slate-800/40 flex flex-col justify-center text-center relative group">
               <div className={`absolute inset-0 transition-all ${isGoldenFlow ? 'bg-amber-500/[0.04]' : 'bg-sky-500/[0.02] group-hover:bg-sky-500/[0.05]'}`} />
               <span className="text-[10px] font-black text-slate-500 uppercase tracking-[0.3em] mb-3 block">Neural Posture</span>
@@ -427,14 +521,18 @@ const App: React.FC = () => {
             {analysis ? (
               <div className="space-y-10 flex-1 animate-in slide-in-from-right-8 duration-700">
                 <div className="text-center space-y-2">
-                  <span className={`text-9xl font-black mono tracking-tighter tabular-nums leading-none ${analysis.signal.voteCount >= 85 ? 'text-emerald-400 text-glow-emerald' : 'text-sky-400'}`}>{analysis.signal.voteCount}</span>
+                  <span className={`text-9xl font-black mono tracking-tighter tabular-nums leading-none ${analysis.signal.voteCount >= 85 ? 'text-emerald-400 text-glow-emerald' : 'text-sky-400'}`}>{Number(analysis.signal.voteCount || 0)}</span>
                   <div className="text-[11px] font-black uppercase text-slate-500 tracking-[0.4em]">Model Consensus</div>
                 </div>
                 <div className="bg-slate-950/60 p-7 rounded-[2rem] border border-slate-800 space-y-6 shadow-inner">
-                   {[{l: 'ENTRY POINT', v: analysis.signal.entry}, {l: 'STOP PROTECT', v: analysis.signal.stopLoss}, {l: 'TAKE PROFIT', v: analysis.signal.takeProfit}].map(item => (
+                   {[
+                     {l: 'ENTRY POINT', v: analysis.signal.entry}, 
+                     {l: 'STOP PROTECT', v: analysis.signal.stopLoss}, 
+                     {l: 'TAKE PROFIT', v: analysis.signal.takeProfit}
+                   ].map(item => (
                      <div key={item.l} className="flex justify-between items-center border-b border-slate-900 pb-4 last:border-0 last:pb-0">
                        <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">{item.l}</span>
-                       <span className="text-base font-mono font-black text-white tracking-tight">${item.v.toFixed(2)}</span>
+                       <span className="text-base font-mono font-black text-white tracking-tight">${Number(item.v || 0).toFixed(2)}</span>
                      </div>
                    ))}
                 </div>

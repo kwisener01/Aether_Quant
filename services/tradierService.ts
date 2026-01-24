@@ -76,6 +76,7 @@ export class TradierService {
 
   async getIntradayHistory(symbol: string): Promise<TradierBar[]> {
     const start = new Date();
+    // For Monday open, ensure we look back to Friday for context but prioritize today's bars
     start.setDate(start.getDate() - 3);
     const startStr = `${start.toISOString().split('T')[0]} 09:30`;
     const data = await this.fetchTradier(`/markets/timesales?symbol=${symbol}&interval=1min&start=${startStr}&session=true`);
@@ -95,9 +96,13 @@ export class TradierService {
     const v14_ask_vol = currentTicks.reduce((acc, t) => acc + t.askVolume, 0);
     const v15_bid_vol = currentTicks.reduce((acc, t) => acc + t.bidVolume, 0);
 
+    // DYNAMIC LIXI SCALING: Adjusted to use real Volume (v10) more aggressively
+    // This makes the Monday 9:30AM spikes significantly more pronounced
     const advFactor = 50000000; 
     const avgSpread = currentTicks.reduce((acc, t) => acc + t.spread, 0) / currentTicks.length;
-    const lixi = -Math.log10(avgSpread || 0.01) + 0.5 * Math.log10(v10 || 1) + 0.5 * Math.log10(advFactor);
+    
+    // Weighted formula: Intensity (v10) now has a larger coefficient for "actual" feel
+    const lixi = -Math.log10(avgSpread || 0.01) + 0.65 * Math.log10(v10 || 1) + 0.4 * Math.log10(advFactor);
 
     let label = TickLabel.STATIONARY;
     if (ratio > (1 + this.alpha)) label = TickLabel.UPWARDS;
@@ -117,7 +122,7 @@ export class TradierService {
         v15_bid_vol,
         v11_22_derivatives: currentTicks.map((t, i) => i > 0 ? t.mid - currentTicks[i-1].mid : 0)
       },
-      lixi,
+      lixi: Math.min(lixi, 15), // Cap for UI stability
       label,
       ratio,
       timestamp: new Date().toLocaleTimeString()

@@ -69,6 +69,18 @@ export interface EnsembleInsight {
   description: string;
 }
 
+export interface SentimentSource {
+  title: string;
+  sentiment: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+  source: string;
+}
+
+export interface SentimentAnalysis {
+  score: number; // -100 to 100
+  label: string;
+  headlines: SentimentSource[];
+}
+
 export interface Signal {
   type: 'BUY' | 'SELL' | 'WAIT';
   confidence: number;
